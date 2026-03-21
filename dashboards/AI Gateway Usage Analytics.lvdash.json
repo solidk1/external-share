@@ -775,25 +775,32 @@
         "    u.requester,\n",
         "    u.endpoint_name,\n",
         "    LOWER(regexp_replace(u.destination_model, '[ .]+', '-')) as model,\n",
-        "    u.input_tokens,\n",
-        "    u.output_tokens,\n",
-        "    COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0) as total_tokens,\n",
-        "    COALESCE(w.workspace_name, u.workspace_id) as workspace_name\n",
+        "    COALESCE(w.workspace_name, u.workspace_id) as workspace_name,\n",
+        "    SUM(COALESCE(u.input_tokens, 0)) as input_tokens,\n",
+        "    SUM(COALESCE(u.output_tokens, 0)) as output_tokens,\n",
+        "    SUM(COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0)) as total_tokens,\n",
+        "    COUNT(*) as request_count\n",
         "  FROM\n",
         "    `system`.`ai_gateway`.`usage` u\n",
         "      LEFT JOIN `system`.`access`.`workspaces_latest` w\n",
         "        ON u.workspace_id = w.workspace_id\n",
         "  WHERE\n",
         "    u.event_time BETWEEN :date_range.min AND :date_range.max\n",
+        "  GROUP BY\n",
+        "    u.requester,\n",
+        "    u.endpoint_name,\n",
+        "    LOWER(regexp_replace(u.destination_model, '[ .]+', '-')),\n",
+        "    COALESCE(w.workspace_name, u.workspace_id)\n",
         "  UNION ALL\n",
         "  SELECT\n",
         "    eu.requester,\n",
         "    se.endpoint_name,\n",
         "    LOWER(regexp_replace(se.entity_name, '[ .]+', '-')) as model,\n",
-        "    eu.input_token_count,\n",
-        "    eu.output_token_count,\n",
-        "    COALESCE(eu.input_token_count, 0) + COALESCE(eu.output_token_count, 0),\n",
-        "    COALESCE(w2.workspace_name, eu.workspace_id)\n",
+        "    COALESCE(w2.workspace_name, eu.workspace_id) as workspace_name,\n",
+        "    SUM(COALESCE(eu.input_token_count, 0)) as input_tokens,\n",
+        "    SUM(COALESCE(eu.output_token_count, 0)) as output_tokens,\n",
+        "    SUM(COALESCE(eu.input_token_count, 0) + COALESCE(eu.output_token_count, 0)) as total_tokens,\n",
+        "    COUNT(*) as request_count\n",
         "  FROM\n",
         "    `system`.`serving`.`endpoint_usage` eu\n",
         "      JOIN `system`.`serving`.`served_entities` se\n",
@@ -802,6 +809,11 @@
         "        ON eu.workspace_id = w2.workspace_id\n",
         "  WHERE\n",
         "    eu.request_time BETWEEN :date_range.min AND :date_range.max\n",
+        "  GROUP BY\n",
+        "    eu.requester,\n",
+        "    se.endpoint_name,\n",
+        "    LOWER(regexp_replace(se.entity_name, '[ .]+', '-')),\n",
+        "    COALESCE(w2.workspace_name, eu.workspace_id)\n",
         "),\n",
         "top_users AS (\n",
         "  SELECT\n",
@@ -824,7 +836,7 @@
         "    SUM(c.input_tokens) as input_tokens,\n",
         "    SUM(c.output_tokens) as output_tokens,\n",
         "    SUM(c.total_tokens) as total_tokens,\n",
-        "    COUNT(*) as request_count\n",
+        "    SUM(c.request_count) as request_count\n",
         "  FROM\n",
         "    combined c\n",
         "      JOIN top_users t\n",
@@ -860,7 +872,12 @@
         "        )\n",
         "  WHERE\n",
         "    u.record_type = 'ORIGINAL'\n",
-        "    AND u.sku_name RLIKE '^ENTERPRISE_(ANTHROPIC|OPENAI|GEMINI|GOOGLE)_MODEL_SERVING$'\n",
+        "    AND u.sku_name IN (\n",
+        "      'ENTERPRISE_ANTHROPIC_MODEL_SERVING',\n",
+        "      'ENTERPRISE_OPENAI_MODEL_SERVING',\n",
+        "      'ENTERPRISE_GEMINI_MODEL_SERVING',\n",
+        "      'ENTERPRISE_GOOGLE_MODEL_SERVING'\n",
+        "    )\n",
         "    AND u.usage_date BETWEEN DATE(:date_range.min) AND DATE(:date_range.max)\n",
         "  GROUP BY\n",
         "    u.usage_metadata.endpoint_name\n",
@@ -893,7 +910,8 @@
         "  SUM(output_tokens) as output_tokens,\n",
         "  SUM(total_tokens) as total_tokens,\n",
         "  SUM(request_count) as request_count,\n",
-        "  ROUND(SUM(proxied_cost), 2) as proxied_cost_usd\n",
+        "  ROUND(SUM(proxied_cost), 2) as proxied_cost_usd,\n",
+        "  CONCAT('$', FORMAT_NUMBER(ROUND(SUM(proxied_cost), 2), 2)) as proxied_cost_display\n",
         "FROM\n",
         "  with_cost\n",
         "GROUP BY\n",
@@ -920,13 +938,6 @@
               }
             }
           }
-        }
-      ],
-      "columns": [
-        {
-          "displayName": "Proxied Cost (List Price)",
-          "description": "Shows null for non-proxied models so table displays -",
-          "expression": "CASE WHEN `proxied_cost_usd` IS NULL OR `proxied_cost_usd` = 0 THEN NULL ELSE `proxied_cost_usd` END"
         }
       ]
     }
@@ -5130,8 +5141,8 @@
                       "expression": "`request_count`"
                     },
                     {
-                      "name": "Proxied Cost (List Price)",
-                      "expression": "`Proxied Cost (List Price)`"
+                      "name": "proxied_cost_display",
+                      "expression": "`proxied_cost_display`"
                     }
                   ],
                   "disaggregated": true
@@ -5177,7 +5188,7 @@
                     "displayName": "Requests"
                   },
                   {
-                    "fieldName": "Proxied Cost (List Price)",
+                    "fieldName": "proxied_cost_display",
                     "displayName": "Proxied Cost (List Price)"
                   }
                 ]
