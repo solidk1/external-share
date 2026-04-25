@@ -1,0 +1,1370 @@
+{
+  "datasets": [
+    {
+      "name": "all_resources",
+      "displayName": "All Resources Inventory",
+      "queryLines": [
+        "WITH latest_clusters AS (\n",
+        "  SELECT\n",
+        "    *,\n",
+        "    ROW_NUMBER() OVER (PARTITION BY cluster_id ORDER BY create_time DESC) as rn\n",
+        "  FROM\n",
+        "    system.compute.clusters\n",
+        "  WHERE\n",
+        "    cluster_source NOT IN ('JOB', 'PIPELINE', 'PIPELINE_MAINTENANCE')\n",
+        "),\n",
+        "latest_warehouses AS (\n",
+        "  SELECT\n",
+        "    *,\n",
+        "    ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) as rn\n",
+        "  FROM\n",
+        "    system.compute.warehouses\n",
+        "),\n",
+        "latest_jobs AS (\n",
+        "  SELECT\n",
+        "    *,\n",
+        "    ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id ORDER BY change_time DESC) as rn\n",
+        "  FROM\n",
+        "    system.lakeflow.jobs\n",
+        "),\n",
+        "latest_pipelines AS (\n",
+        "  SELECT\n",
+        "    *,\n",
+        "    ROW_NUMBER() OVER (PARTITION BY pipeline_id ORDER BY change_time DESC) as rn\n",
+        "  FROM\n",
+        "    system.lakeflow.pipelines\n",
+        "),\n",
+        "latest_endpoints AS (\n",
+        "  SELECT\n",
+        "    *,\n",
+        "    ROW_NUMBER() OVER (PARTITION BY endpoint_id ORDER BY change_time DESC) as rn\n",
+        "  FROM\n",
+        "    system.serving.served_entities\n",
+        "),\n",
+        "billing_resources AS (\n",
+        "  SELECT\n",
+        "    *\n",
+        "  FROM\n",
+        "    (\n",
+        "      SELECT\n",
+        "        CASE billing_origin_product\n",
+        "          WHEN 'APPS' THEN 'App'\n",
+        "          WHEN 'VECTOR_SEARCH' THEN 'Vector Search Index'\n",
+        "          WHEN 'LAKEBASE' THEN 'Lakebase Instance'\n",
+        "          WHEN 'DATABASE' THEN 'Database Instance'\n",
+        "          WHEN 'AI_GATEWAY' THEN 'AI Gateway Endpoint'\n",
+        "        END as resource_type,\n",
+        "        COALESCE(\n",
+        "          usage_metadata.app_id,\n",
+        "          usage_metadata.endpoint_id,\n",
+        "          usage_metadata.database_instance_id\n",
+        "        ) as resource_id,\n",
+        "        COALESCE(\n",
+        "          usage_metadata.app_name,\n",
+        "          usage_metadata.endpoint_name,\n",
+        "          usage_metadata.database_instance_id,\n",
+        "          usage_metadata.endpoint_id\n",
+        "        ) as resource_name,\n",
+        "        COALESCE(identity_metadata.created_by, identity_metadata.run_as) as sys_owner,\n",
+        "        custom_tags,\n",
+        "        billing_origin_product as source_detail,\n",
+        "        ROW_NUMBER() OVER (\n",
+        "            PARTITION BY\n",
+        "              billing_origin_product,\n",
+        "              COALESCE(\n",
+        "                usage_metadata.app_id,\n",
+        "                usage_metadata.endpoint_id,\n",
+        "                usage_metadata.database_instance_id\n",
+        "              )\n",
+        "            ORDER BY usage_start_time DESC\n",
+        "          ) as rn,\n",
+        "        MIN(usage_start_time) OVER (\n",
+        "            PARTITION BY\n",
+        "              billing_origin_product,\n",
+        "              COALESCE(\n",
+        "                usage_metadata.app_id,\n",
+        "                usage_metadata.endpoint_id,\n",
+        "                usage_metadata.database_instance_id\n",
+        "              )\n",
+        "          ) as first_seen\n",
+        "      FROM\n",
+        "        system.billing.usage\n",
+        "      WHERE\n",
+        "        billing_origin_product IN ('APPS', 'VECTOR_SEARCH', 'LAKEBASE', 'DATABASE', 'AI_GATEWAY')\n",
+        "        AND COALESCE(\n",
+        "          usage_metadata.app_id,\n",
+        "          usage_metadata.endpoint_id,\n",
+        "          usage_metadata.database_instance_id\n",
+        "        ) IS NOT NULL\n",
+        "    )\n",
+        "  WHERE\n",
+        "    rn = 1\n",
+        "),\n",
+        "resource_costs AS (\n",
+        "  SELECT\n",
+        "    resource_id,\n",
+        "    SUM(list_cost) as cost_to_date\n",
+        "  FROM\n",
+        "    (\n",
+        "      SELECT\n",
+        "        explode(\n",
+        "          filter(\n",
+        "            array(\n",
+        "              u.usage_metadata.cluster_id,\n",
+        "              u.usage_metadata.warehouse_id,\n",
+        "              CAST(u.usage_metadata.job_id AS STRING),\n",
+        "              u.usage_metadata.dlt_pipeline_id,\n",
+        "              u.usage_metadata.endpoint_id,\n",
+        "              u.usage_metadata.app_id,\n",
+        "              u.usage_metadata.database_instance_id\n",
+        "            ),\n",
+        "            x -> x IS NOT NULL\n",
+        "          )\n",
+        "        ) as resource_id,\n",
+        "        u.usage_quantity * p.pricing.default as list_cost\n",
+        "      FROM\n",
+        "        system.billing.usage u\n",
+        "          JOIN system.billing.list_prices p\n",
+        "            ON u.cloud = p.cloud\n",
+        "            AND u.sku_name = p.sku_name\n",
+        "            AND u.usage_start_time >= p.price_start_time\n",
+        "            AND (\n",
+        "              p.price_end_time IS NULL\n",
+        "              OR u.usage_end_time < p.price_end_time\n",
+        "            )\n",
+        "      WHERE\n",
+        "        u.usage_date >= CURRENT_DATE() - INTERVAL 90 DAY\n",
+        "    )\n",
+        "  WHERE\n",
+        "    resource_id IS NOT NULL\n",
+        "  GROUP BY\n",
+        "    1\n",
+        "),\n",
+        "all_resources AS (\n",
+        "  -- Clusters\n",
+        "  SELECT\n",
+        "    'Cluster' as resource_type,\n",
+        "    cluster_id as resource_id,\n",
+        "    cluster_name as resource_name,\n",
+        "    COALESCE(\n",
+        "      COALESCE(tags, MAP())['Owner'],\n",
+        "      COALESCE(tags, MAP())['owner'],\n",
+        "      COALESCE(tags, MAP())['x_Owner'],\n",
+        "      COALESCE(tags, MAP())['Owner:'],\n",
+        "      COALESCE(tags, MAP())['ownerEmail'],\n",
+        "      owned_by\n",
+        "    ) as owner,\n",
+        "    create_time as created_at,\n",
+        "    delete_time,\n",
+        "    CASE\n",
+        "      WHEN delete_time IS NULL THEN 'Active'\n",
+        "      ELSE 'Deleted'\n",
+        "    END as status,\n",
+        "    to_json(\n",
+        "      map_filter(\n",
+        "        COALESCE(tags, MAP()),\n",
+        "        (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "      )\n",
+        "    ) as tags,\n",
+        "    map_filter(\n",
+        "      COALESCE(tags, MAP()),\n",
+        "      (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "    ) as tags_map,\n",
+        "    cluster_source as source_detail\n",
+        "  FROM\n",
+        "    latest_clusters\n",
+        "  WHERE\n",
+        "    rn = 1\n",
+        "  UNION ALL\n",
+        "  -- SQL Warehouses\n",
+        "  SELECT\n",
+        "    'SQL Warehouse',\n",
+        "    warehouse_id,\n",
+        "    warehouse_name,\n",
+        "    COALESCE(COALESCE(tags, MAP())['Owner'], COALESCE(tags, MAP())['owner'], created_by),\n",
+        "    change_time,\n",
+        "    delete_time,\n",
+        "    CASE\n",
+        "      WHEN delete_time IS NULL THEN 'Active'\n",
+        "      ELSE 'Deleted'\n",
+        "    END,\n",
+        "    to_json(\n",
+        "      map_filter(\n",
+        "        COALESCE(tags, MAP()),\n",
+        "        (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "      )\n",
+        "    ),\n",
+        "    map_filter(\n",
+        "      COALESCE(tags, MAP()),\n",
+        "      (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "    ),\n",
+        "    warehouse_type\n",
+        "  FROM\n",
+        "    latest_warehouses\n",
+        "  WHERE\n",
+        "    rn = 1\n",
+        "  UNION ALL\n",
+        "  -- Jobs\n",
+        "  SELECT\n",
+        "    'Job',\n",
+        "    CAST(job_id AS STRING),\n",
+        "    name,\n",
+        "    COALESCE(\n",
+        "      COALESCE(tags, MAP())['Owner'],\n",
+        "      COALESCE(tags, MAP())['owner'],\n",
+        "      COALESCE(tags, MAP())['x_Owner'],\n",
+        "      creator_user_name,\n",
+        "      CAST(creator_id AS STRING)\n",
+        "    ),\n",
+        "    COALESCE(create_time, change_time),\n",
+        "    delete_time,\n",
+        "    CASE\n",
+        "      WHEN delete_time IS NULL THEN 'Active'\n",
+        "      ELSE 'Deleted'\n",
+        "    END,\n",
+        "    to_json(\n",
+        "      map_filter(\n",
+        "        COALESCE(tags, MAP()),\n",
+        "        (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "      )\n",
+        "    ),\n",
+        "    map_filter(\n",
+        "      COALESCE(tags, MAP()),\n",
+        "      (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "    ),\n",
+        "    COALESCE(trigger_type, 'N/A')\n",
+        "  FROM\n",
+        "    latest_jobs\n",
+        "  WHERE\n",
+        "    rn = 1\n",
+        "  UNION ALL\n",
+        "  -- Pipelines\n",
+        "  SELECT\n",
+        "    'Pipeline',\n",
+        "    pipeline_id,\n",
+        "    name,\n",
+        "    COALESCE(COALESCE(tags, MAP())['Owner'], COALESCE(tags, MAP())['owner'], created_by),\n",
+        "    COALESCE(create_time, change_time),\n",
+        "    delete_time,\n",
+        "    CASE\n",
+        "      WHEN delete_time IS NULL THEN 'Active'\n",
+        "      ELSE 'Deleted'\n",
+        "    END,\n",
+        "    to_json(\n",
+        "      map_filter(\n",
+        "        COALESCE(tags, MAP()),\n",
+        "        (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "      )\n",
+        "    ),\n",
+        "    map_filter(\n",
+        "      COALESCE(tags, MAP()),\n",
+        "      (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "    ),\n",
+        "    pipeline_type\n",
+        "  FROM\n",
+        "    latest_pipelines\n",
+        "  WHERE\n",
+        "    rn = 1\n",
+        "  UNION ALL\n",
+        "  -- Serving Endpoints\n",
+        "  SELECT\n",
+        "    'Serving Endpoint',\n",
+        "    endpoint_id,\n",
+        "    endpoint_name,\n",
+        "    created_by,\n",
+        "    change_time,\n",
+        "    endpoint_delete_time,\n",
+        "    CASE\n",
+        "      WHEN endpoint_delete_time IS NULL THEN 'Active'\n",
+        "      ELSE 'Deleted'\n",
+        "    END,\n",
+        "    '{}',\n",
+        "    CAST(MAP() AS MAP<STRING, STRING>),\n",
+        "    entity_type\n",
+        "  FROM\n",
+        "    latest_endpoints\n",
+        "  WHERE\n",
+        "    rn = 1\n",
+        "  UNION ALL\n",
+        "  -- MLflow Experiments\n",
+        "  SELECT\n",
+        "    'MLflow Experiment',\n",
+        "    experiment_id,\n",
+        "    name,\n",
+        "    CASE\n",
+        "      WHEN name LIKE '/Users/%' THEN SPLIT(name, '/')[2]\n",
+        "      ELSE 'shared'\n",
+        "    END,\n",
+        "    create_time,\n",
+        "    delete_time,\n",
+        "    CASE\n",
+        "      WHEN delete_time IS NULL THEN 'Active'\n",
+        "      ELSE 'Deleted'\n",
+        "    END,\n",
+        "    '{}',\n",
+        "    CAST(MAP() AS MAP<STRING, STRING>),\n",
+        "    'MLFLOW'\n",
+        "  FROM\n",
+        "    system.mlflow.experiments_latest\n",
+        "  UNION ALL\n",
+        "  -- Billing-derived resources\n",
+        "  SELECT\n",
+        "    resource_type,\n",
+        "    resource_id,\n",
+        "    resource_name,\n",
+        "    COALESCE(\n",
+        "      COALESCE(custom_tags, MAP())['Owner'],\n",
+        "      COALESCE(custom_tags, MAP())['owner'],\n",
+        "      COALESCE(custom_tags, MAP())['x_Owner'],\n",
+        "      sys_owner\n",
+        "    ),\n",
+        "    first_seen,\n",
+        "    CAST(NULL AS TIMESTAMP),\n",
+        "    'Active',\n",
+        "    to_json(\n",
+        "      map_filter(\n",
+        "        COALESCE(custom_tags, MAP()),\n",
+        "        (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "      )\n",
+        "    ),\n",
+        "    map_filter(\n",
+        "      COALESCE(custom_tags, MAP()),\n",
+        "      (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "    ),\n",
+        "    source_detail\n",
+        "  FROM\n",
+        "    billing_resources\n",
+        ")\n",
+        "SELECT\n",
+        "  r.resource_type,\n",
+        "  r.resource_id,\n",
+        "  r.resource_name,\n",
+        "  r.owner,\n",
+        "  r.created_at,\n",
+        "  r.delete_time,\n",
+        "  r.status,\n",
+        "  r.tags,\n",
+        "  r.source_detail,\n",
+        "  COALESCE(c.cost_to_date, 0) as cost_to_date\n",
+        "FROM\n",
+        "  all_resources r\n",
+        "    LEFT JOIN resource_costs c\n",
+        "      ON r.resource_id = c.resource_id\n",
+        "WHERE\n",
+        "  (\n",
+        "    CASE\n",
+        "      WHEN\n",
+        "        :tag_name = ''\n",
+        "        AND :tag_value = ''\n",
+        "      THEN\n",
+        "        TRUE\n",
+        "      WHEN\n",
+        "        :tag_name != ''\n",
+        "        AND :tag_value = ''\n",
+        "      THEN\n",
+        "        element_at(r.tags_map, :tag_name) IS NOT NULL\n",
+        "      WHEN\n",
+        "        :tag_name = ''\n",
+        "        AND :tag_value != ''\n",
+        "      THEN\n",
+        "        array_contains(map_values(r.tags_map), :tag_value)\n",
+        "      ELSE element_at(r.tags_map, :tag_name) = :tag_value\n",
+        "    END\n",
+        "  )"
+      ],
+      "parameters": [
+        {
+          "displayName": "Tag Name",
+          "keyword": "tag_name",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "displayName": "Tag Value",
+          "keyword": "tag_value",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": ""
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "billing_cost",
+      "displayName": "Resource Billing Cost",
+      "queryLines": [
+        "SELECT\n",
+        "  u.usage_date,\n",
+        "  u.billing_origin_product as product,\n",
+        "  COALESCE(u.identity_metadata.run_as, u.identity_metadata.created_by) as user_identity,\n",
+        "  SUM(u.usage_quantity * p.pricing.default) as list_cost,\n",
+        "  SUM(u.usage_quantity) as total_dbus\n",
+        "FROM\n",
+        "  system.billing.usage u\n",
+        "    JOIN system.billing.list_prices p\n",
+        "      ON u.cloud = p.cloud\n",
+        "      AND u.sku_name = p.sku_name\n",
+        "      AND u.usage_start_time >= p.price_start_time\n",
+        "      AND (\n",
+        "        p.price_end_time IS NULL\n",
+        "        OR u.usage_end_time < p.price_end_time\n",
+        "      )\n",
+        "WHERE\n",
+        "  u.usage_date >= CURRENT_DATE() - INTERVAL 30 DAY\n",
+        "GROUP BY\n",
+        "  1,\n",
+        "  2,\n",
+        "  3"
+      ]
+    },
+    {
+      "name": "tag_options",
+      "displayName": "Tag Options",
+      "queryLines": [
+        "WITH all_tags AS (\n",
+        "  SELECT\n",
+        "    explode(\n",
+        "      map_filter(\n",
+        "        COALESCE(tags, MAP()),\n",
+        "        (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "      )\n",
+        "    ) as (tag_name, tag_value)\n",
+        "  FROM\n",
+        "    system.compute.clusters\n",
+        "  WHERE\n",
+        "    cluster_source NOT IN ('JOB', 'PIPELINE', 'PIPELINE_MAINTENANCE')\n",
+        "    AND tags IS NOT NULL\n",
+        "    AND size(tags) > 0\n",
+        "  UNION ALL\n",
+        "  SELECT\n",
+        "    explode(\n",
+        "      map_filter(\n",
+        "        COALESCE(tags, MAP()),\n",
+        "        (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "      )\n",
+        "    ) as (tag_name, tag_value)\n",
+        "  FROM\n",
+        "    system.compute.warehouses\n",
+        "  WHERE\n",
+        "    tags IS NOT NULL\n",
+        "    AND size(tags) > 0\n",
+        "  UNION ALL\n",
+        "  SELECT\n",
+        "    explode(\n",
+        "      map_filter(\n",
+        "        COALESCE(tags, MAP()),\n",
+        "        (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "      )\n",
+        "    ) as (tag_name, tag_value)\n",
+        "  FROM\n",
+        "    system.lakeflow.jobs\n",
+        "  WHERE\n",
+        "    tags IS NOT NULL\n",
+        "    AND size(tags) > 0\n",
+        "  UNION ALL\n",
+        "  SELECT\n",
+        "    explode(\n",
+        "      map_filter(\n",
+        "        COALESCE(tags, MAP()),\n",
+        "        (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "      )\n",
+        "    ) as (tag_name, tag_value)\n",
+        "  FROM\n",
+        "    system.lakeflow.pipelines\n",
+        "  WHERE\n",
+        "    tags IS NOT NULL\n",
+        "    AND size(tags) > 0\n",
+        "  UNION ALL\n",
+        "  SELECT\n",
+        "    explode(\n",
+        "      map_filter(\n",
+        "        COALESCE(custom_tags, MAP()),\n",
+        "        (k, v) -> LOWER(TRIM(k)) NOT IN ('owner', 'x_owner', 'owner:', 'owneremail')\n",
+        "      )\n",
+        "    ) as (tag_name, tag_value)\n",
+        "  FROM\n",
+        "    system.billing.usage\n",
+        "  WHERE\n",
+        "    billing_origin_product IN ('APPS', 'VECTOR_SEARCH', 'LAKEBASE', 'DATABASE', 'AI_GATEWAY')\n",
+        "    AND custom_tags IS NOT NULL\n",
+        "    AND size(custom_tags) > 0\n",
+        "    AND usage_date >= CURRENT_DATE() - INTERVAL 90 DAY\n",
+        ")\n",
+        "SELECT DISTINCT\n",
+        "  tag_name,\n",
+        "  tag_value\n",
+        "FROM\n",
+        "  all_tags\n",
+        "WHERE\n",
+        "  tag_name IS NOT NULL\n",
+        "  AND TRIM(tag_name) != ''\n",
+        "  AND tag_value IS NOT NULL\n",
+        "ORDER BY\n",
+        "  tag_name,\n",
+        "  tag_value"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "06206abe",
+      "displayName": "Overview",
+      "layout": [
+        {
+          "widget": {
+            "name": "header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Resource Tracking & Cost by User"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_resource_type",
+            "queries": [
+              {
+                "name": "dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f1406d832211dea3d938485c157276_resource_type",
+                "query": {
+                  "datasetName": "all_resources",
+                  "fields": [
+                    {
+                      "name": "resource_type",
+                      "expression": "`resource_type`"
+                    },
+                    {
+                      "name": "resource_type_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Resource Type",
+                "showTitle": true
+              },
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "resource_type",
+                    "queryName": "dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f1406d832211dea3d938485c157276_resource_type"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_status",
+            "queries": [
+              {
+                "name": "dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f1406d832211dea3d938485c157276_status",
+                "query": {
+                  "datasetName": "all_resources",
+                  "fields": [
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "status_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Status",
+                "showTitle": true
+              },
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "status",
+                    "queryName": "dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f1406d832211dea3d938485c157276_status"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 1,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_owner",
+            "queries": [
+              {
+                "name": "dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f1406d832211dea3d938485c157276_owner",
+                "query": {
+                  "datasetName": "all_resources",
+                  "fields": [
+                    {
+                      "name": "owner",
+                      "expression": "`owner`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "matchMode": "contains",
+              "isCaseSensitive": false,
+              "frame": {
+                "title": "Search Owner",
+                "showTitle": true
+              },
+              "widgetType": "filter-text-entry",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "owner",
+                    "queryName": "dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f1406d832211dea3d938485c157276_owner"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 1,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "counter_active",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "all_resources",
+                  "fields": [
+                    {
+                      "name": "count(resource_id)",
+                      "expression": "COUNT(`resource_id`)"
+                    }
+                  ],
+                  "filters": [
+                    {
+                      "expression": "`status` IN ('Active')"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Active Resources",
+                "showTitle": true
+              },
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "count(resource_id)",
+                  "displayName": "Active Resources"
+                }
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "counter_users",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "all_resources",
+                  "fields": [
+                    {
+                      "name": "countdistinct(owner)",
+                      "expression": "COUNT(DISTINCT `owner`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Unique Owners",
+                "showTitle": true
+              },
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "countdistinct(owner)",
+                  "displayName": "Unique Owners"
+                }
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 5,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "counter_cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_cost",
+                  "fields": [
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Total Cost (30d)",
+                "showTitle": true
+              },
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(list_cost)",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 1
+                    },
+                    "abbreviation": "compact"
+                  },
+                  "displayName": "Total Cost"
+                }
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 5,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "resources_table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "all_resources",
+                  "fields": [
+                    {
+                      "name": "resource_type",
+                      "expression": "`resource_type`"
+                    },
+                    {
+                      "name": "resource_id",
+                      "expression": "`resource_id`"
+                    },
+                    {
+                      "name": "resource_name",
+                      "expression": "`resource_name`"
+                    },
+                    {
+                      "name": "owner",
+                      "expression": "`owner`"
+                    },
+                    {
+                      "name": "created_at",
+                      "expression": "`created_at`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "cost_to_date",
+                      "expression": "`cost_to_date`"
+                    },
+                    {
+                      "name": "tags",
+                      "expression": "`tags`"
+                    },
+                    {
+                      "name": "source_detail",
+                      "expression": "`source_detail`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Resource Inventory",
+                "showTitle": true
+              },
+              "rowsPerPage": 25,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "resource_type",
+                    "displayName": "Type"
+                  },
+                  {
+                    "fieldName": "resource_id",
+                    "displayName": "Resource ID"
+                  },
+                  {
+                    "fieldName": "resource_name",
+                    "displayName": "Resource Name"
+                  },
+                  {
+                    "fieldName": "owner",
+                    "displayName": "Owner"
+                  },
+                  {
+                    "fieldName": "created_at",
+                    "displayName": "Created At"
+                  },
+                  {
+                    "fieldName": "status",
+                    "displayName": "Status"
+                  },
+                  {
+                    "fieldName": "cost_to_date",
+                    "displayName": "Cost (90d)"
+                  },
+                  {
+                    "fieldName": "tags",
+                    "displayName": "Tags"
+                  },
+                  {
+                    "fieldName": "source_detail",
+                    "displayName": "Source"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 8,
+            "width": 12,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "cost_by_user",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_cost",
+                  "fields": [
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    },
+                    {
+                      "name": "user_identity",
+                      "expression": "`user_identity`"
+                    },
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    }
+                  ],
+                  "filters": [
+                    {
+                      "expression": "`user_identity` IS NOT NULL"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "title": "Top Cost by User (30d)",
+                "showTitle": true
+              },
+              "mark": {
+                "layout": "stack"
+              },
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "user_identity",
+                  "axis": {
+                    "hideTitle": true
+                  },
+                  "displayName": "User",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(list_cost)",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 0
+                    },
+                    "abbreviation": "compact"
+                  },
+                  "displayName": "Total Cost ($)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "product",
+                  "legend": {
+                    "hide": true
+                  },
+                  "displayName": "Product",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 16,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "cost_by_product",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_cost",
+                  "fields": [
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    },
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "title": "Cost by Product (30d)",
+                "showTitle": true
+              },
+              "widgetType": "pie",
+              "encodings": {
+                "angle": {
+                  "fieldName": "sum(list_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Total Cost"
+                },
+                "color": {
+                  "fieldName": "product",
+                  "legend": {
+                    "position": "right"
+                  },
+                  "displayName": "Product",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "label": {
+                  "show": true
+                }
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 16,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "cost_trend",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_cost",
+                  "fields": [
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    },
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    },
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "title": "Daily Cost Trend (30d)",
+                "showTitle": true
+              },
+              "mark": {
+                "layout": "stack"
+              },
+              "widgetType": "area",
+              "encodings": {
+                "x": {
+                  "fieldName": "usage_date",
+                  "axis": {
+                    "hideTitle": true
+                  },
+                  "displayName": "Date",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(list_cost)",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 0
+                    },
+                    "abbreviation": "compact"
+                  },
+                  "displayName": "Daily Cost ($)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "product",
+                  "legend": {
+                    "position": "bottom"
+                  },
+                  "displayName": "Product",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 23,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "resources_by_type",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "all_resources",
+                  "fields": [
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "resource_type",
+                      "expression": "`resource_type`"
+                    },
+                    {
+                      "name": "count(resource_id)",
+                      "expression": "COUNT(`resource_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "title": "Resources by Type",
+                "showTitle": true
+              },
+              "mark": {
+                "layout": "stack"
+              },
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "resource_type",
+                  "axis": {
+                    "hideTitle": true
+                  },
+                  "displayName": "Resource Type",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  }
+                },
+                "y": {
+                  "fieldName": "count(resource_id)",
+                  "displayName": "Count",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "status",
+                  "displayName": "Status",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "label": {
+                  "show": true
+                }
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 23,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_tag_name",
+            "queries": [
+              {
+                "name": "dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f14079668315f785644a6c35dabd51_tag_name",
+                "query": {
+                  "datasetName": "tag_options",
+                  "fields": [
+                    {
+                      "name": "tag_name",
+                      "expression": "`tag_name`"
+                    },
+                    {
+                      "name": "tag_name_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f1406d832211dea3d938485c157276_tag_name",
+                "query": {
+                  "datasetName": "all_resources",
+                  "parameters": [
+                    {
+                      "name": "tag_name",
+                      "keyword": "tag_name"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Tag Name",
+                "showTitle": true
+              },
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "tag_name",
+                    "queryName": "dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f14079668315f785644a6c35dabd51_tag_name"
+                  },
+                  {
+                    "parameterName": "tag_name",
+                    "queryName": "parameter_dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f1406d832211dea3d938485c157276_tag_name"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_tag_value",
+            "queries": [
+              {
+                "name": "dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f14079668315f785644a6c35dabd51_tag_value",
+                "query": {
+                  "datasetName": "tag_options",
+                  "fields": [
+                    {
+                      "name": "tag_value",
+                      "expression": "`tag_value`"
+                    },
+                    {
+                      "name": "tag_value_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "parameter_dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f1406d832211dea3d938485c157276_tag_value",
+                "query": {
+                  "datasetName": "all_resources",
+                  "parameters": [
+                    {
+                      "name": "tag_value",
+                      "keyword": "tag_value"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Tag Value",
+                "showTitle": true
+              },
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "tag_value",
+                    "queryName": "dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f14079668315f785644a6c35dabd51_tag_value"
+                  },
+                  {
+                    "parameterName": "tag_value",
+                    "queryName": "parameter_dashboards/01f1406cec7e151dab2177f6ed566794/datasets/01f1406d832211dea3d938485c157276_tag_value"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 3,
+            "width": 6,
+            "height": 2
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1"
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "widgetHeaderAlignment": "ALIGNMENT_UNSPECIFIED"
+    },
+    "applyModeEnabled": false
+  }
+}
