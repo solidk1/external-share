@@ -40,7 +40,8 @@ The converter's output is a directly-runnable SQL file: `CREATE TABLE` × N + on
 Self-contained reference for the YAML inside `CREATE VIEW … WITH METRICS LANGUAGE YAML AS $$ … $$`. Sufficient for everything the PBI converter emits and every hand-edit this skill describes.
 
 ### Prerequisites
-- Databricks Runtime **17.2+** (YAML `version: "1.1"`). DBR 16.4–17.1 supports the older `version: "0.1"` (used only for window measures, see below).
+- Databricks Runtime **17.2+**. **Always use YAML `version: "1.1"`** — for everything (dimensions, measures, window measures alike).
+- On DBR < 17.2, dim `comment:`/`synonyms:` aren't recognized by the older serde — re-run the converter with `--no-dim-metadata` to strip them. Measures keep full metadata regardless.
 - SQL warehouse with `CAN USE`; `SELECT` on source tables; `CREATE TABLE`/`USE SCHEMA` in the target schema.
 
 ### Top-level structure
@@ -126,10 +127,10 @@ Rules: the fact is always `source` in `on:`; joined tables are referenced by the
 
 ### Window measures (period-over-period, running totals)
 
-Window measures use **`version: "0.1"`** (still experimental as of DBR 17.2; v1.1 doesn't subsume it). Add a `window:` block to a measure:
+Window measures are still experimental but use the standard YAML `version: "1.1"` like everything else. Add a `window:` block to a measure:
 
 ```yaml
-version: "0.1"               # Required for window measures
+version: "1.1"
 ...
 measures:
   - name: Total Revenue
@@ -234,7 +235,7 @@ Don't use for:
    - [ ] **`expr:` is `MEASURE(\`Base Measure\`)`, NOT a re-inlined SUM/+SUM expression.** (See non-negotiable default #3.)
    - [ ] **`CASE WHEN <numeric> THEN ... END`** patterns the converter emitted from `IF([SPLY], var/SPLY, BLANK())` are NOT valid SQL — `CASE WHEN` requires a boolean. Replace with `MEASURE(\`var\`) / NULLIF(MEASURE(\`SPLY\`), 0)`.
    - [ ] If the measure references columns from a joined dim (e.g., `scenario`, `date`), qualify with the join alias (`scenario.\`scenario\``, not `\`scenario\``).
-   - [ ] Window measures require `version: 0.1` at the top of the YAML. Top-level `comment:` is NOT valid in v0.1 — use YAML `#` comments instead.
+   - [ ] Always use `version: "1.1"` at the top of the YAML — for window measures and everything else.
    - [ ] If using `range: trailing N year`, the `order:` dim MUST be DATE (not INT) — add a `Year Start` dim as `DATE_TRUNC('YEAR', date.\`date\`)`.
 
 6. **Wire data ingestion as a separate step.** The tables are empty. Use Lakeflow Connect, PBI Desktop → Export → CSV → `COPY INTO`, or a Spark job. Do NOT auto-emit `INSERT INTO` SQL — that's a separate task the user must explicitly request.
