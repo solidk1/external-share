@@ -1,38 +1,34 @@
 #!/usr/bin/env python3
 """
-Convert a Power BI .pbit (Power BI Template) into a Databricks UC metric view
-plus optional CREATE TABLE DDL.
+PBI .pbit → Databricks UC metric view scaffold.
 
-Reads .pbit (ZIP containing DataModelSchema JSON / TMSL) using only the Python
-stdlib — no third-party deps. The .pbit format exposes the FULL tabular model
-schema (every column, every relationship, every M-loaded base column) as JSON,
-unlike .pbix where the same data lives in an XPRESS9-compressed binary that
-community readers like pbixray decode incompletely.
+This is a SCAFFOLDER, not a translator. The DAX → metric-view-SQL translation
+is the **agent's** (LLM) job, not this script's. The script:
 
-The tool:
-  1. Parses tables, columns (incl. calculated), measures (DAX), relationships.
-  2. Picks the table with the most measures as the fact (overrideable).
-  3. Builds star-schema joins from active relationships.
-  4. Translates each DAX measure to SQL — substantially more coverage than
-     the previous .pbix-based version. Highlights:
-       - LASTDATE/FIRSTDATE → FILTER (WHERE is_latest_snapshot) + auto-augments
-         the source SQL with the boolean flag column.
-       - DATEADD( ..., -1, DAY/MONTH/...) → flagged with a LAG-column suggestion;
-         emits a TODO and the matching LAG into the SQL source so the consumer
-         only has to wire the measure expr.
-       - VAR / RETURN inlined when bindings are pure expressions.
-       - SWITCH(TRUE(), cond, val, ..., default) → CASE WHEN cond THEN val.
-       - IFERROR(a, b) → a (rely on NULLIF in DIVIDE; fallback dropped).
-       - BLANK() → NULL.
-       - FORMAT(x, "...") → x (format strings are consumer-side).
-       - SELECTEDVALUE/ISFILTERED IF-wrappers (UI edge cases) unwrapped.
-       - String concat & → ||.
-       - Power 10^N → literal (1000000 etc.).
-       - Bare [Measure] refs → MEASURE(`Measure`) (or `column` if unknown).
-       - Forward MEASURE() refs detected and inlined to keep the YAML
-         createable in one shot (Databricks metric views require backward refs).
-       - FILTER('T', expr) inside CALCULATE → unwrapped to the bare predicate.
-  5. Emits schema-only DDL + the metric view CREATE VIEW. Never INSERTs.
+  1. Parses .pbit (ZIP containing TMSL JSON in DataModelSchema) using only the
+     stdlib. The .pbit format exposes the FULL tabular schema as JSON — every
+     base column, calculated column, measure DAX, and relationship.
+  2. Picks a fact table (most measures, or --fact-table override).
+  3. Builds star-schema joins from active relationships (warns on inactive).
+  4. Emits CREATE TABLE DDL for every table (kimball or fidelity style).
+  5. Emits a metric-view YAML SCAFFOLD where:
+       - source / joins / dimensions are fully populated mechanically
+       - synonyms are populated mechanically (PBI bracket / qualified form,
+         deduped against name:)
+       - each measure is a placeholder: original DAX preserved as a YAML
+         comment, expr: AGENT_TRANSLATE_DAX, comment: AGENT_AUTHOR
+  6. Optionally appends a verification SQL block — one
+     `SELECT MEASURE(\`X\`) FROM view LIMIT 1` per measure (commented out
+     until the agent fills in the expressions).
+
+The agent applying this skill must:
+  - Read each measure's preserved original DAX
+  - Translate to metric-view SQL using its own LLM brain + the cookbook in
+    `references/dax-to-sql-patterns.md`
+  - LLM-author the comment from the DAX + business context
+  - Replace the AGENT_TRANSLATE_DAX / AGENT_AUTHOR placeholders
+  - Add snapshot-flag columns (is_latest_snapshot, is_yesterday_snapshot, ...)
+    to source: when any measure needs them — see SKILL.md § snapshot flags
 
 Two naming styles:
   --style kimball   (default) lowercase snake_case, dim_*/fact_* prefixes.
@@ -41,7 +37,7 @@ Two naming styles:
                     Requires Delta columnMapping for table DDL.
 
 Run:
-  dax_to_metric_view.py model.pbit --catalog-schema main.sales --emit-ddl --out out.sql
+  dax_to_metric_view.py model.pbit --catalog-schema main.sales --emit-ddl --out scaffold.sql
   dax_to_metric_view.py model.pbit --style fidelity --source main.sales.fact_sales
 """
 from __future__ import annotations
@@ -54,670 +50,15 @@ import zipfile
 from pathlib import Path
 
 # ----------------------------------------------------------------------------
-# Balanced-paren / arg-splitting utilities
-# ----------------------------------------------------------------------------
-
-def split_top_level_args(s: str) -> list[str]:
-    """Split a comma-separated arg list, respecting parens, brackets, braces, and quoted strings.
-
-    DAX `IN {"A","B"}` set literals must NOT be split — track `{`/`}` depth.
-    """
-    out, cur, depth, in_str, str_ch = [], [], 0, False, ""
-    for c in s:
-        if in_str:
-            cur.append(c)
-            if c == str_ch:
-                in_str = False
-            continue
-        if c in ('"', "'"):
-            in_str = True
-            str_ch = c
-            cur.append(c)
-            continue
-        if c in "([{":
-            depth += 1
-        elif c in ")]}":
-            depth -= 1
-        if c == "," and depth == 0:
-            out.append("".join(cur).strip())
-            cur = []
-        else:
-            cur.append(c)
-    if cur:
-        out.append("".join(cur).strip())
-    return out
-
-
-def find_call(expr: str, fname: str) -> tuple[int, int, str] | None:
-    """Find the next call to FNAME(...) and return (start, end, args_string)."""
-    pat = re.compile(r"\b" + re.escape(fname) + r"\s*\(", re.IGNORECASE)
-    m = pat.search(expr)
-    if not m:
-        return None
-    start = m.start()
-    i = m.end()
-    depth = 1
-    in_str, str_ch = False, ""
-    while i < len(expr) and depth:
-        c = expr[i]
-        if in_str:
-            if c == str_ch:
-                in_str = False
-        elif c in ('"', "'"):
-            in_str = True
-            str_ch = c
-        elif c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-        i += 1
-    if depth != 0:
-        return None
-    return start, i, expr[m.end() : i - 1]
-
-
-def _replace_calls(s: str, fname: str, build_replacement) -> str:
-    """Walk every call to FNAME(...) and rewrite it via build_replacement(args).
-    Forward-advancing cursor; safe even when the SQL name matches the DAX name."""
-    offset = 0
-    while True:
-        hit = find_call(s[offset:], fname)
-        if not hit:
-            return s
-        start, end, inner = hit
-        args = split_top_level_args(inner) if inner else []
-        repl = build_replacement(args)
-        if repl is None:
-            offset += end
-            continue
-        abs_start = offset + start
-        abs_end = offset + end
-        s = s[:abs_start] + repl + s[abs_end:]
-        offset = abs_start + len(repl)
-
-
-# ----------------------------------------------------------------------------
-# DAX preprocessing
-# ----------------------------------------------------------------------------
-
-_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
-_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
-_POWER_LITERAL_RE = re.compile(r"\b10\s*\^\s*(\d+)\b")  # 10^6 → 1000000
-
-
-def strip_dax_comments(s: str) -> str:
-    s = _BLOCK_COMMENT_RE.sub(" ", s)
-    s = _LINE_COMMENT_RE.sub("", s)
-    return s
-
-
-def expand_power_literals(s: str) -> str:
-    """`10^6` → `1000000`. Catches the very common DAX-/-1M divisor idiom."""
-    def rep(m: re.Match) -> str:
-        n = int(m.group(1))
-        return str(10 ** n)
-    return _POWER_LITERAL_RE.sub(rep, s)
-
-
-# ----------------------------------------------------------------------------
-# DAX -> SQL atomic translations
-# ----------------------------------------------------------------------------
-
-DAX_STRING_LITERAL_RE = re.compile(r'"([^"]*)"')
-
-
-def _drop_table_qualifier(s: str) -> str:
-    """'Sales'[Amount] -> `Amount`,  Sales[Amount] -> `Amount`."""
-    s = re.sub(r"'(?:[^']+)'\[([^\]]+)\]", r"`\1`", s)
-    s = re.sub(r"\b[A-Za-z_]\w*\[([^\]]+)\]", r"`\1`", s)
-    return s
-
-
-def _convert_string_literals(s: str) -> str:
-    def rep(m: re.Match) -> str:
-        return "'" + m.group(1).replace("'", "''") + "'"
-    return DAX_STRING_LITERAL_RE.sub(rep, s)
-
-
-def _translate_logical_ops(s: str) -> str:
-    s = re.sub(r"&&", " AND ", s)
-    s = re.sub(r"\|\|", " OR ", s)
-    return s
-
-
-def _translate_string_concat(s: str) -> str:
-    """DAX `&` (string concat) → SQL `||`. Skip `&&` and `&=`."""
-    return re.sub(r"(?<![&|])&(?!&)", " || ", s)
-
-
-def _translate_blank(s: str) -> str:
-    return re.sub(r"\bBLANK\s*\(\s*\)", "NULL", s, flags=re.IGNORECASE)
-
-
-def _translate_truefalse(s: str) -> str:
-    s = re.sub(r"\bTRUE\s*\(\s*\)", "TRUE", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bFALSE\s*\(\s*\)", "FALSE", s, flags=re.IGNORECASE)
-    return s
-
-
-_SIMPLE_AGGS = {
-    "SUM": ("SUM", 1),
-    "AVERAGE": ("AVG", 1),
-    "MIN": ("MIN", 1),
-    "MAX": ("MAX", 1),
-    "COUNT": ("COUNT", 1),
-    "COUNTA": ("COUNT", 1),
-    "DISTINCTCOUNT": ("COUNT_DISTINCT", 1),
-}
-
-
-def _translate_simple_aggs(s: str) -> tuple[str, list[str]]:
-    warnings: list[str] = []
-    for dax_name, (sql_name, _argc) in _SIMPLE_AGGS.items():
-        def make_repl(args, dax_name=dax_name, sql_name=sql_name):
-            if len(args) != 1:
-                warnings.append(f"{dax_name}() with {len(args)} args left for manual review")
-                return None
-            col = _drop_table_qualifier(args[0])
-            if sql_name == "COUNT_DISTINCT":
-                return f"COUNT(DISTINCT {col})"
-            return f"{sql_name}({col})"
-        s = _replace_calls(s, dax_name, make_repl)
-    return s, warnings
-
-
-def _translate_countrows(s: str) -> str:
-    return _replace_calls(s, "COUNTROWS", lambda args: "COUNT(1)")
-
-
-def _translate_divide(s: str) -> str:
-    def repl(args):
-        if len(args) < 2:
-            return None
-        return f"({args[0]}) / NULLIF(({args[1]}), 0)"
-    return _replace_calls(s, "DIVIDE", repl)
-
-
-def _translate_format(s: str) -> str:
-    """FORMAT(expr, "..."): drop the format string, keep expr (formatting is consumer-side)."""
-    def repl(args):
-        if not args:
-            return None
-        return args[0]
-    return _replace_calls(s, "FORMAT", repl)
-
-
-def _translate_iferror(s: str) -> str:
-    """IFERROR(a, b) → a. Most IFERROR uses in DAX guard against /0; we already use NULLIF."""
-    def repl(args):
-        if not args:
-            return None
-        return args[0] if len(args) == 1 else args[0]  # explicit
-    return _replace_calls(s, "IFERROR", repl)
-
-
-def _translate_concatenate(s: str) -> str:
-    def repl(args):
-        if len(args) < 2:
-            return None
-        return "concat(" + ", ".join(args) + ")"
-    return _replace_calls(s, "CONCATENATE", repl)
-
-
-def _translate_if(s: str) -> str:
-    def repl(args):
-        if len(args) == 2:
-            return f"CASE WHEN {args[0]} THEN {args[1]} END"
-        if len(args) == 3:
-            return f"CASE WHEN {args[0]} THEN {args[1]} ELSE {args[2]} END"
-        return None
-    return _replace_calls(s, "IF", repl)
-
-
-def _translate_switch(s: str) -> str:
-    """SWITCH(target, v1, r1, ..., default).
-    Special-case SWITCH(TRUE(), cond1, val1, ..., default) → CASE WHEN cond1 ... END.
-    """
-    def repl(args):
-        if len(args) < 3:
-            return None
-        target, rest = args[0], args[1:]
-        default = None
-        if len(rest) % 2 == 1:
-            default = rest[-1]
-            rest = rest[:-1]
-        # Detect SWITCH(TRUE(), ...) — the conditions are boolean themselves.
-        is_true_switch = re.match(r"\s*TRUE\s*(\(\s*\))?\s*$", target, re.IGNORECASE) is not None
-        if is_true_switch:
-            whens = [f"WHEN {rest[i]} THEN {rest[i + 1]}" for i in range(0, len(rest), 2)]
-        else:
-            whens = [f"WHEN {target} = {rest[i]} THEN {rest[i + 1]}" for i in range(0, len(rest), 2)]
-        out = "CASE " + " ".join(whens)
-        if default is not None:
-            out += f" ELSE {default}"
-        return out + " END"
-    return _replace_calls(s, "SWITCH", repl)
-
-
-# ----------------------------------------------------------------------------
-# CALCULATE / FILTER / LASTDATE coordination
+# Synonyms (mechanical 1:1 mapping from PBI names — no DAX semantics)
 # ----------------------------------------------------------------------------
 #
-# CALCULATE(expr, filter1, filter2, ...) becomes "expr FILTER (WHERE f1 AND f2)".
-# - FILTER('Table', cond)  →  cond
-# - LASTDATE('Cal'[Date])  →  is_latest_snapshot   (and we mark the measure
-#                              as needing the source-SQL augmentation)
-# - FIRSTDATE('Cal'[Date]) →  is_first_snapshot   (same shape)
+# Synonyms are rule-based, not LLM-authored. The mapping from a PBI measure
+# name to its DAX bracket form / qualified form is purely lexical and does not
+# benefit from LLM judgment.
 #
-
-# Set by translate_dax_expr; reset per measure. Side-channel for letting the
-# post-processor know which measures need source augmentation.
-_TRANSLATION_FLAGS: dict[str, bool] = {}
-
-
-_DATEADD_DAY_NEG1_RE = re.compile(
-    r"^\s*DATEADD\s*\(\s*(.*?)\s*,\s*-\s*1\s*,\s*DAY\s*\)\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _filter_arg_to_sql(arg: str) -> str:
-    """One filter arg of CALCULATE → SQL boolean predicate."""
-    s = arg.strip()
-
-    # FILTER('T', cond) → cond
-    mf = find_call(s, "FILTER")
-    if mf and mf[0] == 0 and mf[1] == len(s):
-        fargs = split_top_level_args(mf[2])
-        if len(fargs) >= 2:
-            return _filter_arg_to_sql(",".join(fargs[1:]))
-
-    # DATEADD(LASTDATE('Cal'[Date]), -1, DAY) → is_yesterday_snapshot
-    # DATEADD('Cal'[Date], -1, DAY)            → is_yesterday_snapshot (when used
-    # as a filter, this means "yesterday's snapshot row" — same shape as latest).
-    mda = _DATEADD_DAY_NEG1_RE.match(s)
-    if mda:
-        _TRANSLATION_FLAGS["needs_yesterday_snapshot"] = True
-        return "is_yesterday_snapshot"
-
-    # LASTDATE('Cal'[Date]) → is_latest_snapshot
-    ml = find_call(s, "LASTDATE")
-    if ml and ml[0] == 0 and ml[1] == len(s):
-        _TRANSLATION_FLAGS["needs_latest_snapshot"] = True
-        return "is_latest_snapshot"
-
-    # FIRSTDATE('Cal'[Date]) → is_first_snapshot
-    mfs = find_call(s, "FIRSTDATE")
-    if mfs and mfs[0] == 0 and mfs[1] == len(s):
-        _TRANSLATION_FLAGS["needs_first_snapshot"] = True
-        return "is_first_snapshot"
-
-    # Otherwise translate as an expression
-    sql, _w = translate_dax_expr_inner(s)
-    return sql
-
-
-_AGG_RE = re.compile(
-    r"\b(SUM|AVG|MIN|MAX|COUNT|COUNT_DISTINCT)\s*\(", re.IGNORECASE
-)
-
-
-def _attach_filter_to_aggregates(body: str, where: str) -> str:
-    """Attach `FILTER (WHERE <where>)` to every aggregate in `body`.
-
-    SQL `FILTER (WHERE ...)` is a clause on the aggregate function call, NOT on
-    the surrounding arithmetic. So `CALCULATE(SUM(x)/10^6, p)` must become
-    `SUM(x) FILTER (WHERE p) / 1000000`, not `SUM(x) / 1000000 FILTER (WHERE p)`.
-
-    We find each aggregate-function call by name (`SUM(`, `AVG(`, …, including
-    the COUNT(DISTINCT …) shape produced by _translate_simple_aggs) and append
-    ` FILTER (WHERE <where>)` immediately after its matching closing paren.
-    """
-    if not where:
-        return body
-    out_parts: list[str] = []
-    cursor = 0
-    while True:
-        m = _AGG_RE.search(body, cursor)
-        if not m:
-            out_parts.append(body[cursor:])
-            break
-        # Already followed by FILTER? Skip — caller is reapplying.
-        # We still need to AND the new predicate into the existing WHERE.
-        agg_start = m.start()
-        # find matching close paren for the (
-        depth = 1
-        i = m.end()
-        in_str, str_ch = False, ""
-        while i < len(body) and depth > 0:
-            c = body[i]
-            if in_str:
-                if c == str_ch:
-                    in_str = False
-                i += 1
-                continue
-            if c in ("'", '"'):
-                in_str = True
-                str_ch = c
-            elif c == "(":
-                depth += 1
-            elif c == ")":
-                depth -= 1
-            i += 1
-        if depth != 0:
-            # malformed — bail and emit the rest unchanged
-            out_parts.append(body[cursor:])
-            break
-        # i is now position right after the matching ).
-        # Check if there's already a FILTER (WHERE ...) clause.
-        rest = body[i:].lstrip()
-        leading_ws = body[i:i + (len(body[i:]) - len(rest))]
-        if rest.upper().startswith("FILTER"):
-            # find paren after FILTER
-            fp = rest.find("(")
-            if fp != -1:
-                fdepth = 1
-                j = fp + 1
-                in_str2, str_ch2 = False, ""
-                while j < len(rest) and fdepth > 0:
-                    c = rest[j]
-                    if in_str2:
-                        if c == str_ch2:
-                            in_str2 = False
-                        j += 1
-                        continue
-                    if c in ("'", '"'):
-                        in_str2 = True
-                        str_ch2 = c
-                    elif c == "(":
-                        fdepth += 1
-                    elif c == ")":
-                        fdepth -= 1
-                    j += 1
-                # rest[fp+1:j-1] is the FILTER inner; expect "WHERE <pred>"
-                inner = rest[fp + 1:j - 1].strip()
-                inner_up = inner.upper()
-                if inner_up.startswith("WHERE"):
-                    existing_pred = inner[5:].strip()
-                    new_pred = f"({existing_pred}) AND ({where})"
-                    new_clause = f"FILTER (WHERE {new_pred})"
-                    out_parts.append(body[cursor:i])
-                    out_parts.append(leading_ws + new_clause)
-                    cursor = i + len(leading_ws) + (j)  # past the original FILTER (...)
-                    continue
-        # No existing FILTER — attach a new one.
-        out_parts.append(body[cursor:i])
-        out_parts.append(f" FILTER (WHERE {where})")
-        cursor = i
-    return "".join(out_parts)
-
-
-def _translate_calculate(s: str) -> str:
-    def repl(args):
-        if not args:
-            return None
-        body = translate_dax_expr_inner(args[0])[0]
-        filters: list[str] = []
-        for f in args[1:]:
-            filters.append(_filter_arg_to_sql(f))
-        if not filters:
-            return body
-        where = " AND ".join(filters)
-        # If the body contains aggregates, attach FILTER to each aggregate so
-        # surrounding arithmetic (e.g. /10^6) stays outside the FILTER clause.
-        if _AGG_RE.search(body):
-            return _attach_filter_to_aggregates(body, where)
-        # No aggregate found — fall back to old behavior (rare).
-        return f"{body} FILTER (WHERE {where})"
-    return _replace_calls(s, "CALCULATE", repl)
-
-
-# ----------------------------------------------------------------------------
-# VAR/RETURN inlining
-# ----------------------------------------------------------------------------
-
-# Match: VAR <name> = <expr>  followed by VAR or RETURN (case-insensitive).
-# We do this by walking the string and tracking parens depth so we don't split
-# inside a function call. The body of each VAR is the text up to the next
-# top-level VAR/RETURN keyword.
-
-_VAR_KEYWORD = re.compile(r"\bVAR\b", re.IGNORECASE)
-_RETURN_KEYWORD = re.compile(r"\bRETURN\b", re.IGNORECASE)
-
-
-def _scan_top_level_keyword(s: str, pat: re.Pattern, start: int = 0) -> int | None:
-    """Find the next match of pat at parens-depth zero, starting at `start`."""
-    depth = 0
-    in_str, str_ch = False, ""
-    i = start
-    while i < len(s):
-        c = s[i]
-        if in_str:
-            if c == str_ch:
-                in_str = False
-            i += 1
-            continue
-        if c in ('"', "'"):
-            in_str = True
-            str_ch = c
-            i += 1
-            continue
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-        if depth == 0:
-            m = pat.match(s, i)
-            if m:
-                return m.start()
-        i += 1
-    return None
-
-
-def inline_var_return(s: str) -> str | None:
-    """If `s` is of the shape `VAR x = e1 [VAR y = e2 ...] RETURN body`,
-    inline each VAR into the body and return the resulting expression.
-    Returns None if the pattern doesn't match cleanly."""
-    var_pos = _scan_top_level_keyword(s, _VAR_KEYWORD, 0)
-    if var_pos is None:
-        return None
-    # collect (name, expr_text) pairs in order
-    bindings: list[tuple[str, str]] = []
-    cursor = var_pos
-    while True:
-        # Match VAR <name> = <expr>
-        m = re.match(r"\s*VAR\s+([A-Za-z_]\w*)\s*=\s*", s[cursor:], re.IGNORECASE)
-        if not m:
-            break
-        name = m.group(1)
-        expr_start = cursor + m.end()
-        # Find the next top-level VAR or RETURN keyword
-        nxt_var = _scan_top_level_keyword(s, _VAR_KEYWORD, expr_start)
-        nxt_ret = _scan_top_level_keyword(s, _RETURN_KEYWORD, expr_start)
-        candidates = [p for p in (nxt_var, nxt_ret) if p is not None]
-        if not candidates:
-            return None
-        end = min(candidates)
-        bindings.append((name, s[expr_start:end].strip().rstrip(",").strip()))
-        cursor = end
-        if nxt_ret is not None and end == nxt_ret:
-            break
-    # Now match RETURN <body>
-    rm = re.match(r"\s*RETURN\s+", s[cursor:], re.IGNORECASE)
-    if not rm:
-        return None
-    body = s[cursor + rm.end():].strip()
-    # Inline bindings into body. Substitute each VAR name with `(expr)`.
-    # Use word-boundary matching.
-    inlined = body
-    for name, expr in reversed(bindings):
-        # Substitute references — but don't substitute inside other VAR exprs
-        # (we already iterate in reverse so later VARs' refs in earlier exprs
-        # are handled by chained substitution).
-        wrapped = "(" + expr + ")"
-        inlined = re.sub(r"\b" + re.escape(name) + r"\b", wrapped, inlined)
-        # Also propagate through earlier bindings (chain)
-        bindings_resolved = []
-        for n2, e2 in bindings:
-            if n2 == name:
-                bindings_resolved.append((n2, e2))
-            else:
-                bindings_resolved.append((n2, re.sub(r"\b" + re.escape(name) + r"\b", wrapped, e2)))
-        bindings = bindings_resolved
-    return inlined.strip()
-
-
-# ----------------------------------------------------------------------------
-# SELECTEDVALUE / ISFILTERED IF-wrapper unwrap
-# ----------------------------------------------------------------------------
-#
-# Many measures look like:
-#   IF(SELECTEDVALUE(...) = 'X' && [foo]<>BLANK(), "-",
-#   IF(NOT SELECTEDVALUE(...) IN {"A","B"} && [foo]<>BLANK(), "-",
-#       <core math>))
-# These are UI edge-case display rules driven by slicers. The "core math"
-# is what we want; the slicer-based edges have no clean SQL analog without a
-# query-time slicer parameter. Strategy: for each top-level IF where the
-# condition contains SELECTEDVALUE/ISFILTERED/HASONEVALUE and the THEN branch
-# is a literal placeholder ("-", "", or BLANK), drop the IF and keep the ELSE.
-
-_SLICER_FUNCS_RE = re.compile(
-    r"\b(?:SELECTEDVALUE|ISFILTERED|HASONEVALUE|HASONEFILTER|ISCROSSFILTERED)\b",
-    re.IGNORECASE,
-)
-# Conditions like `Logic=BLANK()`, `MEASURE(\`X\`)<>BLANK()`, or after translation
-# `Logic IS NULL`, `MEASURE(...) IS NOT NULL` are pure BLANK-fallback display
-# wrappers — common in Power BI `IF(<core>=BLANK(), "-", <core>)`-style measures.
-_BLANK_CHECK_RE = re.compile(
-    r"(?:=\s*BLANK\s*\(\s*\)|<>\s*BLANK\s*\(\s*\)|=\s*NULL\b|<>\s*NULL\b|"
-    r"\bIS\s+NULL\b|\bIS\s+NOT\s+NULL\b)",
-    re.IGNORECASE,
-)
-
-
-def _is_placeholder_value(s: str) -> bool:
-    s = s.strip()
-    if s in ('"-"', '""', "BLANK()", "BLANK ()", "NULL", "0"):
-        return True
-    if re.match(r"^'[-\s]?'$", s):
-        return True
-    return False
-
-
-def _strip_outer_parens(s: str) -> str:
-    """Strip a single layer of outer balanced parens, repeatedly."""
-    while True:
-        s2 = s.strip()
-        if len(s2) >= 2 and s2[0] == "(" and s2[-1] == ")":
-            depth = 0
-            paired = True
-            for i, c in enumerate(s2):
-                if c == "(":
-                    depth += 1
-                elif c == ")":
-                    depth -= 1
-                if depth == 0 and i < len(s2) - 1:
-                    paired = False
-                    break
-            if paired:
-                s = s2[1:-1]
-                continue
-        return s2
-
-
-def _exprs_equal(a: str, b: str) -> bool:
-    """Loose equality: ignore whitespace and outer parens."""
-    return _strip_outer_parens(a).replace(" ", "") == _strip_outer_parens(b).replace(" ", "")
-
-
-def unwrap_slicer_if(s: str) -> str:
-    """Repeatedly strip UI-display IF wrappers. Handled patterns:
-
-      A) IF(<slicer-cond>, "-", real)               → real
-      B) IF(<slicer-cond>, BLANK(), real)            → real
-      C) IF(<expr> = BLANK(), "-", <expr>)           → <expr>          (or = NULL / IS NULL)
-      D) IF(<expr> <> BLANK(), <expr>, "-")          → <expr>          (or <> NULL / IS NOT NULL)
-      E) IF(<expr> = BLANK() && <other>, "-", <expr>)→ <expr>
-      F) IF(<expr> <> BLANK() && <other>, <expr>, "-")→ <expr>
-      G) IF(<cond>, "-", IF(<cond>, "-", real))      → real            (recursive)
-
-    The unwrap recurses into a leading ELSE branch automatically because the
-    loop reapplies on the new outer expression. Strips outer parens so that
-    e.g. `(IF(slicer, "-", real))` is also unwrapped.
-    """
-    prev = None
-    while prev != s:
-        prev = s
-        s = _strip_outer_parens(s)
-        ifm = find_call(s, "IF")
-        if not ifm or ifm[0] != 0 or ifm[1] != len(s):
-            break
-        args = split_top_level_args(ifm[2])
-        if len(args) < 2:
-            break
-        cond = args[0].strip()
-        then_branch = args[1].strip()
-        else_branch = args[2].strip() if len(args) > 2 else ""
-
-        slicer = bool(_SLICER_FUNCS_RE.search(cond))
-        blank_chk = bool(_BLANK_CHECK_RE.search(cond))
-
-        # A/B/G: slicer-cond + placeholder THEN
-        if slicer and _is_placeholder_value(then_branch):
-            s = else_branch if else_branch else "NULL"
-            continue
-        # C/E: blank-check + placeholder THEN + ELSE matches the blank-checked expr
-        if blank_chk and _is_placeholder_value(then_branch) and else_branch:
-            s = else_branch
-            continue
-        # D/F: blank-check + placeholder ELSE + THEN matches the checked expr
-        if blank_chk and _is_placeholder_value(else_branch) and then_branch:
-            s = then_branch
-            continue
-        # If both branches are equal, just return either.
-        if then_branch and else_branch and _exprs_equal(then_branch, else_branch):
-            s = then_branch
-            continue
-        break
-    return s.strip()
-
-
-# ----------------------------------------------------------------------------
-# Time-intel detection (LASTDATE / DATEADD / SAMEPERIODLASTYEAR)
-# ----------------------------------------------------------------------------
-
-_TIME_INTEL_FUNCS = ("DATEADD", "TOTALYTD", "TOTALMTD", "TOTALQTD",
-                     "SAMEPERIODLASTYEAR", "PARALLELPERIOD", "PREVIOUSDAY",
-                     "PREVIOUSMONTH", "PREVIOUSQUARTER", "PREVIOUSYEAR",
-                     "NEXTDAY", "NEXTMONTH", "NEXTQUARTER", "NEXTYEAR")
-
-
-def detect_time_intel(s: str) -> list[str]:
-    found = []
-    for f in _TIME_INTEL_FUNCS:
-        if re.search(r"\b" + f + r"\b", s, re.IGNORECASE):
-            found.append(f)
-    return found
-
-
-# ----------------------------------------------------------------------------
-# Measure synonyms
-# ----------------------------------------------------------------------------
-#
-# Every emitted measure carries a `synonyms:` field listing the original PBI
-# measure name verbatim. Databricks metric views (DBR 17.2+) accept `synonyms:`
-# as a list on each measure; Genie / UC AI/BI consumers use it to resolve user
-# queries to the right metric-view measure when the migrated `name:` differs
-# from what the user typed.
-#
-# Comments (the `comment:` field) are NOT generated here. They are LLM-authored
-# by the agent calling this skill, who has full understanding of the measure's
-# business meaning. The converter preserves any human-authored description from
-# the PBI model as a starting point; everything else is the agent's job.
-#
-# For variations of the original name worth indexing as synonyms (the agent
-# may add more — e.g. ASCII-only or de-spaced forms), this helper builds the
-# baseline list.
+# Comments (the `comment:` field), in contrast, ARE LLM-authored — they
+# capture business meaning that the DAX shape doesn't.
 
 def build_measure_synonyms(orig_name: str, metric_view_name: str | None = None) -> list[str]:
     """Synonyms for a migrated measure.
@@ -760,10 +101,8 @@ def build_dimension_synonyms(
       2. Qualified form: `'Calendar'[Order Date]`         →  canonical
 
     For metric-view discovery, the useful synonyms are:
-      - The bare PBI column name (when it differs from `dim_name`) — what most
-        Genie / AI users will type
+      - The bare PBI column name (when it differs from `dim_name`)
       - The qualified `'Table'[Column]` form (when it differs from `dim_name`)
-        — what someone reading the original PBI report or DAX will type
 
     `dim_name` is the metric-view `name:` (often a "Table Column" concat for
     join-table dims, or a snake_case-rename for fact dims). Anything matching
@@ -784,133 +123,15 @@ def build_dimension_synonyms(
 
 
 # ----------------------------------------------------------------------------
-# Top-level entry
+# .pbit loader (stdlib-only)
 # ----------------------------------------------------------------------------
 
-# `_translate_calculate` recurses into `translate_dax_expr_inner`, which is the
-# entry point used both by the public wrapper and by recursion.
-def translate_dax_expr_inner(dax: str) -> tuple[str, list[str]]:
-    s = dax
-    s = _translate_calculate(s)
-    s = _translate_iferror(s)
-    s = _translate_format(s)
-    s = _translate_concatenate(s)
-    s = _translate_countrows(s)
-    s = _translate_divide(s)
-    s = _translate_if(s)
-    s = _translate_switch(s)
-    s, agg_warn = _translate_simple_aggs(s)
-
-    s = _drop_table_qualifier(s)
-    s = _convert_string_literals(s)
-    # Order matters: translate DAX logical ops (&& → AND, || → OR) BEFORE
-    # string concat (& → ||), otherwise the SQL || we just produced gets
-    # rewritten back to OR.
-    s = _translate_logical_ops(s)
-    s = _translate_string_concat(s)
-    s = _translate_blank(s)
-    s = _translate_truefalse(s)
-    return s.strip(), agg_warn
-
-
-def translate_dax_expr(dax: str) -> tuple[str, list[str], dict]:
-    """Translate a DAX expression to a SQL expression usable inside a metric view.
-
-    Returns (sql, warnings, flags). flags includes:
-        needs_latest_snapshot: bool — measure references LASTDATE on the calendar
-        needs_first_snapshot:  bool — measure references FIRSTDATE
-        time_intel:            list[str] — DAX time-intel funcs detected
-        needs_manual_review:   bool — translation is incomplete / DAX-only
-    """
-    global _TRANSLATION_FLAGS
-    _TRANSLATION_FLAGS = {}
-
-    warnings: list[str] = []
-    flags: dict = {}
-
-    s = dax.strip()
-    if s.startswith("="):
-        s = s[1:].strip()
-    s = strip_dax_comments(s)
-    s = expand_power_literals(s)
-
-    # 1) Unwrap UI-edge-case IF(SELECTEDVALUE(...)=..., "-", real) wrappers.
-    #    First pass before VAR inlining handles measures whose top-level shape
-    #    is already an IF wrapper (no VAR/RETURN around them).
-    s = unwrap_slicer_if(s)
-
-    # 2) Inline VAR / RETURN if present (best-effort).
-    inlined = inline_var_return(s)
-    if inlined is not None:
-        s = inlined
-        # 2b) Re-run unwrap AFTER inlining — many measures hide the IF chain
-        #     inside `VAR Output = IF(...) RETURN Output` form, where the outer
-        #     pre-inline shape isn't an IF and so the first pass misses it.
-        s = unwrap_slicer_if(s)
-
-    # 3) Atomic translations FIRST — CALCULATE/IF/agg rewrites; this also
-    #    consumes DATEADD-d-1 patterns inside CALCULATE filters and rewrites
-    #    them to is_yesterday_snapshot, so we don't want to flag those below.
-    sql, agg_warn = translate_dax_expr_inner(s)
-    warnings.extend(agg_warn)
-
-    # 4) Run unwrap once more on the translated form — DAX `IF(=BLANK()…)`
-    #    becomes SQL `IF(<expr> IS NULL, …)` after translation; the unwrap
-    #    can keep stripping placeholder branches at this stage too.
-    sql = unwrap_slicer_if(sql)
-
-    # 5) Now detect surviving time-intel / filter-context constructs in the
-    #    translated SQL. Anything still here was NOT consumed by the inner
-    #    translator and genuinely needs manual review.
-    time_intel = detect_time_intel(sql)
-    if time_intel:
-        flags["time_intel"] = time_intel
-        for tk in time_intel:
-            warnings.append(f"contains {tk} (manual rewrite — see references/dax-to-sql-patterns.md § Period-over-period patterns)")
-
-    # 6) Detect remaining VAR/RETURN (couldn't inline) — flag.
-    if re.search(r"\bVAR\b", sql, re.IGNORECASE) or re.search(r"\bRETURN\b", sql, re.IGNORECASE):
-        warnings.append("contains VAR/RETURN that could not be inlined automatically")
-
-    # 7) Detect filter-context manipulation.
-    for tk in ("ALLEXCEPT", "ALLSELECTED", "USERELATIONSHIP", "EARLIER",
-               "EARLIEST", "RANKX", "TOPN", "LOOKUPVALUE"):
-        if re.search(r"\b" + tk + r"\b", sql, re.IGNORECASE):
-            warnings.append(f"contains {tk} (manual rewrite required)")
-    if re.search(r"\bALL\s*\(", sql, re.IGNORECASE):
-        warnings.append("contains ALL( (manual rewrite — drops filter context)")
-
-    # 8) Detect leftover SELECTEDVALUE/ISFILTERED that survived all unwraps.
-    if _SLICER_FUNCS_RE.search(sql):
-        warnings.append("contains SELECTEDVALUE/ISFILTERED (slicer-context — manual rewrite)")
-
-    # 9) Surface the LASTDATE/FIRSTDATE/yesterday-snapshot flags from the side channel.
-    if _TRANSLATION_FLAGS.get("needs_latest_snapshot"):
-        flags["needs_latest_snapshot"] = True
-    if _TRANSLATION_FLAGS.get("needs_first_snapshot"):
-        flags["needs_first_snapshot"] = True
-    if _TRANSLATION_FLAGS.get("needs_yesterday_snapshot"):
-        flags["needs_yesterday_snapshot"] = True
-
-    flags["needs_manual_review"] = bool(warnings)
-    return sql, warnings, flags
-
-
-# ----------------------------------------------------------------------------
-# .pbit (Power BI Template) loader
-# ----------------------------------------------------------------------------
-#
-# A .pbit is a ZIP. The relevant member is `DataModelSchema` (UTF-8 JSON, may
-# have a leading BOM and may be UTF-16 encoded in some PBI versions).
-# Structure (TMSL):
-#   { "name": "...", "compatibilityLevel": ..., "model": { ... } }
-# Within `model`:
-#   tables: [{name, columns:[{name, dataType, isHidden, summarizeBy, expression?}],
-#             measures:[{name, expression, description?}]}]
-#   relationships: [{name, fromTable, fromColumn, toTable, toColumn, isActive}]
-#
-
-_PBIT_SCHEMA_MEMBER_CANDIDATES = ("DataModelSchema", "DataModel/Schema")
+# DataModelSchema lives at the root of the .pbit ZIP (sometimes under a path
+# variant in older PBI versions).
+_PBIT_SCHEMA_MEMBER_CANDIDATES = (
+    "DataModelSchema",
+    "DataModel/DataModelSchema",
+)
 
 
 def _read_datamodel_schema(zf: zipfile.ZipFile) -> dict:
@@ -927,7 +148,7 @@ def _read_datamodel_schema(zf: zipfile.ZipFile) -> dict:
             "DataModelSchema not found in .pbit. Members present:\n  "
             + "\n  ".join(zf.namelist())
         )
-    # Try common encodings — PBI usually writes UTF-16 LE BOM, sometimes UTF-8.
+    # PBI usually writes UTF-16 LE BOM, sometimes UTF-8.
     for enc in ("utf-16", "utf-16-le", "utf-8-sig", "utf-8"):
         try:
             text = raw.decode(enc)
@@ -957,8 +178,7 @@ def _is_calc_table(table: dict) -> bool:
 
 
 def load_pbit_as_model(path: Path) -> dict:
-    """Open a .pbit and return a normalized model dict shaped like the older
-    .pbix loader (so the rest of the pipeline is unchanged):
+    """Open a .pbit and return a normalized model dict:
         {tables: [{name, columns:[...], measures:[...]}], relationships: [...]}
     """
     with zipfile.ZipFile(path) as zf:
@@ -967,7 +187,6 @@ def load_pbit_as_model(path: Path) -> dict:
     model = root.get("model") or {}
     tables_in = model.get("tables") or []
 
-    # Build tables list
     tables_out: list[dict] = []
     for t in tables_in:
         name = t.get("name")
@@ -985,6 +204,7 @@ def load_pbit_as_model(path: Path) -> dict:
                 "summarizeBy": (c.get("summarizeBy") or "none"),
                 "expression": _expr_to_string(c.get("expression")) if "expression" in c else None,
                 "type": c.get("type"),  # e.g. 'calculated'
+                "description": _expr_to_string(c.get("description")) if c.get("description") else None,
             })
         measures_out = []
         for m in t.get("measures", []) or []:
@@ -995,6 +215,7 @@ def load_pbit_as_model(path: Path) -> dict:
                 "name": mname,
                 "expression": _expr_to_string(m.get("expression")),
                 "description": _expr_to_string(m.get("description")) if m.get("description") else None,
+                "_source_table": name,
             })
         tables_out.append({
             "name": name,
@@ -1004,7 +225,6 @@ def load_pbit_as_model(path: Path) -> dict:
             "isCalcTable": _is_calc_table(t),
         })
 
-    # Relationships
     rel_out: list[dict] = []
     for r in model.get("relationships", []) or []:
         ft, fc = r.get("fromTable"), r.get("fromColumn")
@@ -1057,7 +277,9 @@ def needs_column_mapping(cols: list[dict]) -> bool:
     return any(re.search(r"[^A-Za-z0-9_]", c["name"]) for c in cols)
 
 
-# Hidden, auto-generated PBI tables.
+# Hidden, auto-generated PBI tables. Auto date/time hierarchies live in these
+# placeholders — they have no business data and must be excluded everywhere
+# (DDL emit, fact picking, joins, dimensions).
 _AUTO_DATE_PREFIXES = ("LocalDateTable_", "DateTableTemplate_")
 
 
@@ -1066,7 +288,7 @@ def _is_real_table(name: str) -> bool:
 
 
 # ----------------------------------------------------------------------------
-# Fact picking + metric view assembly
+# Fact picking
 # ----------------------------------------------------------------------------
 
 def pick_fact_table(tables: list[dict], explicit_fact: str | None) -> dict:
@@ -1081,24 +303,24 @@ def pick_fact_table(tables: list[dict], explicit_fact: str | None) -> dict:
 
 def detect_fact_date_column(fact: dict, doc: dict) -> str | None:
     """Find the column on the fact table that joins to a calendar dim.
-    Returns the (original) column name, or None."""
+    Returns the (original) column name, or None.
+
+    Used purely as a hint for the agent — the script no longer auto-injects
+    snapshot-flag columns into source: SQL. The agent decides whether to add
+    them based on which measures use LASTDATE / DATEADD / FIRSTDATE.
+    """
     fact_name = fact["name"]
-    # Heuristic 1: an active relationship from fact to a table whose name
-    # contains 'calendar' or 'date'.
     for r in doc.get("relationships", []):
         if r.get("fromTable") != fact_name or r.get("isActive") is False:
             continue
         to = (r.get("toTable") or "").lower()
         if "calendar" in to or "date" in to:
             return r["fromColumn"]
-    # Heuristic 2: a fact column whose name contains 'date' or 'snapshot'
-    # and whose data type is dateTime/date.
     for c in fact.get("columns", []):
         n = c["name"].lower()
         dt = (c.get("dataType") or "").lower()
         if ("date" in n or "snapshot" in n) and ("date" in dt or "time" in dt):
             return c["name"]
-    # Heuristic 3: any datetime column.
     for c in fact.get("columns", []):
         dt = (c.get("dataType") or "").lower()
         if "date" in dt or "time" in dt:
@@ -1106,41 +328,9 @@ def detect_fact_date_column(fact: dict, doc: dict) -> str | None:
     return None
 
 
-def topo_sort_measures(measures: list[dict]) -> list[dict]:
-    """Sort measures so each measure's MEASURE(`X`) refs are to measures defined earlier.
-    Falls back to original order on cycles (with a warning attached to the offending measure).
-    """
-    name_to_idx = {m["name"]: i for i, m in enumerate(measures)}
-    # edges: from m → measures it references via MEASURE(`...`)
-    edges: dict[int, set[int]] = {i: set() for i in range(len(measures))}
-    ref_re = re.compile(r"MEASURE\s*\(\s*`([^`]+)`\s*\)", re.IGNORECASE)
-    for i, m in enumerate(measures):
-        for r in ref_re.finditer(m.get("expr", "")):
-            other = r.group(1)
-            j = name_to_idx.get(other)
-            if j is not None and j != i:
-                edges[i].add(j)
-    # Kahn's algorithm: a measure can be emitted once all its refs are emitted.
-    emitted: list[int] = []
-    seen: set[int] = set()
-
-    def visit(i: int, stack: set[int]) -> None:
-        if i in seen:
-            return
-        if i in stack:
-            # cycle — bail; emit anyway in the original order
-            return
-        stack.add(i)
-        for j in edges[i]:
-            visit(j, stack)
-        stack.discard(i)
-        if i not in seen:
-            seen.add(i)
-            emitted.append(i)
-    for i in range(len(measures)):
-        visit(i, set())
-    return [measures[i] for i in emitted]
-
+# ----------------------------------------------------------------------------
+# Metric view scaffold (no DAX translation here — that's the agent's job)
+# ----------------------------------------------------------------------------
 
 def build_metric_view(
     doc: dict,
@@ -1150,6 +340,13 @@ def build_metric_view(
     catalog_schema: str | None = None,
     fact_suffix: str | None = None,
 ) -> tuple[dict, list[str]]:
+    """Build the structural scaffold of the metric view.
+
+    Populates source / joins / dimensions / synonyms mechanically. Each measure
+    in the output dict carries its name + ORIGINAL DAX (preserved verbatim for
+    the agent to translate); `expr:` is left as the placeholder string
+    'AGENT_TRANSLATE_DAX' until the agent fills it in.
+    """
     tables = [t for t in (doc.get("tables") or []) if _is_real_table(t["name"])]
     if not tables:
         raise SystemExit("No tables in model")
@@ -1178,32 +375,17 @@ def build_metric_view(
     def fq_table(name: str) -> str:
         return f"{cs_prefix}.{physical_table(name)}"
 
-    col_rename: dict[str, str] = {}
-    for t in tables:
-        for c in t.get("columns", []):
-            orig = c["name"]
-            phys = physical_col(orig)
-            col_rename[orig] = phys
-
-    def rewrite_col_refs(sql: str) -> str:
-        if style != "kimball":
-            return sql
-        # Sort by length desc so longer names match first (avoid partial-replace issues).
-        for orig in sorted(col_rename.keys(), key=len, reverse=True):
-            phys = col_rename[orig]
-            if orig == phys:
-                continue
-            sql = sql.replace(f"`{orig}`", f"`{phys}`")
-        return sql
-
-    # Joins (only direct fact -> dim, active)
+    # Joins: only direct fact → dim, active relationships only.
     join_aliases: dict[str, str] = {}
     joins: list[dict] = []
     for r in relationships:
         if r.get("fromTable") != fact_name:
             continue
         if r.get("isActive") is False:
-            warnings.append(f"inactive relationship to {r['toTable']!r} skipped — wire manually if needed (USERELATIONSHIP equivalent)")
+            warnings.append(
+                f"inactive relationship to {r['toTable']!r} skipped — "
+                f"if a measure needs USERELATIONSHIP, agent must add a second join entry by hand"
+            )
             continue
         to_tbl = r["toTable"]
         if to_tbl in join_aliases:
@@ -1218,13 +400,7 @@ def build_metric_view(
             "on": f"source.{_safe(from_col)} = {alias}.{_safe(to_col)}",
         })
 
-    # Dimensions: non-numeric / non-summarized fact columns + all join-table columns.
-    # Each entry carries:
-    #   - name:     the metric-view dimension name
-    #   - expr:     the resolved SQL expression
-    #   - synonyms: bare PBI col name (if differs) + 'Table'[Column] DAX form (if differs)
-    #   - comment:  preserved-from-PBI description if present (otherwise omitted —
-    #               the agent calling this skill is expected to LLM-author the rest)
+    # Dimensions: non-numeric / non-summarized fact columns + all join columns.
     dimensions: list[dict] = []
 
     def _dim_entry(name: str, expr: str, orig_table: str, orig_col: str, pbi_desc: str | None) -> dict:
@@ -1250,7 +426,7 @@ def build_metric_view(
             expr=col_ref(col["name"]),
             orig_table=fact_name,
             orig_col=col["name"],
-            pbi_desc=_expr_to_string(col.get("description")) if col.get("description") else None,
+            pbi_desc=col.get("description"),
         ))
 
     for t in tables:
@@ -1265,143 +441,49 @@ def build_metric_view(
                 expr=f"{alias}.{col_ref(col['name'])}",
                 orig_table=t["name"],
                 orig_col=col["name"],
-                pbi_desc=_expr_to_string(col.get("description")) if col.get("description") else None,
+                pbi_desc=col.get("description"),
             ))
 
     if not dimensions:
         warnings.append("no dimensions discovered; metric view requires at least one")
 
-    # Measures: translate each
+    # Measures: collect, do NOT translate. Each entry carries the original DAX
+    # for the agent to translate. `expr` stays as the AGENT_TRANSLATE_DAX
+    # sentinel until the agent fills it in.
     measures: list[dict] = []
-    needs_latest = False
-    needs_first = False
-    needs_yesterday = False
     for t in tables:
         for m in t.get("measures", []) or []:
-            dax = m.get("expression", "") or ""
-            sql, warn, flags = translate_dax_expr(dax)
             entry = {
                 "name": m["name"],
-                "expr": sql,
-                "_dax": dax,
-                "_warn": warn,
-                "_flags": flags,
+                "expr": "AGENT_TRANSLATE_DAX",
+                "_dax": m.get("expression", "") or "",
+                "_source_table": t["name"],
+                "synonyms": build_measure_synonyms(m["name"], m["name"]),
             }
-            # Synonyms: always include the bracketed DAX form `[<orig>]` so a
-            # user typing the original DAX reference finds the migrated measure.
-            # The bare original name is included only if a hand-edit later renames
-            # the metric-view `name:` (build_measure_synonyms drops it when name
-            # matches, so default no-rename emits only `[<orig>]`).
-            entry["synonyms"] = build_measure_synonyms(m["name"], m["name"])
-            # Comment: only the human-authored PBI description is preserved.
-            # The agent calling this skill is expected to LLM-author richer
-            # comments (one per measure) based on the DAX expression, business
-            # context, and naming. The converter does NOT auto-generate comments
-            # — rule-based shape detection produces shallow, generic text that
-            # often misleads ("Ratio of x to expr") and is worse than no comment.
-            desc = _expr_to_string(m.get("description")) if m.get("description") else None
+            desc = m.get("description")
             if desc:
                 entry["comment"] = desc.strip()
             measures.append(entry)
-            if warn:
-                warnings.append(f"measure {m['name']!r}: " + "; ".join(warn))
-            needs_latest = needs_latest or flags.get("needs_latest_snapshot", False)
-            needs_first = needs_first or flags.get("needs_first_snapshot", False)
-            needs_yesterday = needs_yesterday or flags.get("needs_yesterday_snapshot", False)
-
-    # Resolve bare-bracket [Measure] references
-    measure_name_set = {m["name"] for m in measures}
-
-    def resolve_bare_brackets(sql: str) -> str:
-        def rep(mt):
-            x = mt.group(1)
-            if x in measure_name_set:
-                return f"MEASURE(`{x}`)"
-            return f"`{x}`"
-        return re.sub(r"\[([^\]]+)\]", rep, sql)
-
-    for m in measures:
-        m["expr"] = rewrite_col_refs(resolve_bare_brackets(m["expr"]))
-
-    # Topo-sort to make all forward MEASURE() refs backward
-    measures = topo_sort_measures(measures)
-
-    # Detect remaining forward refs (after sort) — those are cycles, inline the
-    # referenced measure's expr if simple, else flag.
-    pos = {m["name"]: i for i, m in enumerate(measures)}
-    fwd_refs_inlined = 0
-    ref_re = re.compile(r"MEASURE\s*\(\s*`([^`]+)`\s*\)", re.IGNORECASE)
-    for i, m in enumerate(measures):
-        def rep(mt, i=i):
-            nonlocal fwd_refs_inlined
-            target = mt.group(1)
-            j = pos.get(target)
-            if j is not None and j > i:
-                tgt = measures[j]
-                # Only inline simple, non-flagged exprs to avoid runaway expansion
-                if not tgt.get("_flags", {}).get("needs_manual_review", False):
-                    fwd_refs_inlined += 1
-                    return "(" + tgt["expr"] + ")"
-            return mt.group(0)
-        m["expr"] = ref_re.sub(rep, m["expr"])
 
     if not measures:
         warnings.append("no measures discovered; metric view requires at least one")
 
-    # Source: SQL block when augmentation is needed; else plain table ref.
-    needs_any_snapshot = needs_latest or needs_first or needs_yesterday
-    fact_date_col_orig = detect_fact_date_column(fact, doc) if needs_any_snapshot else None
-
-    if needs_any_snapshot:
-        if fact_date_col_orig is None:
-            warnings.append(
-                "LASTDATE/FIRSTDATE/DATEADD-D-1 detected but no date column found on fact; "
-                "is_latest_snapshot/is_first_snapshot/is_yesterday_snapshot flags emitted "
-                "against `data_cutoff_dt` as a default — adjust if your fact uses a different date column."
-            )
-            fact_date_col_phys = "data_cutoff_dt"
-        else:
-            fact_date_col_phys = physical_col(fact_date_col_orig)
-        source_lines = [
-            f"  SELECT",
-            f"    f.*,",
-        ]
-        if needs_latest:
-            source_lines.append(
-                f"    (`{fact_date_col_phys}` = MAX(`{fact_date_col_phys}`) OVER ()) AS is_latest_snapshot,"
-            )
-        if needs_first:
-            source_lines.append(
-                f"    (`{fact_date_col_phys}` = MIN(`{fact_date_col_phys}`) OVER ()) AS is_first_snapshot,"
-            )
-        if needs_yesterday:
-            # Use DENSE_RANK over distinct dates so this works even when the
-            # fact has gaps (weekends, holidays, etc.) — "yesterday" is the
-            # second-most-recent snapshot date, not literally MAX-1day.
-            source_lines.append(
-                f"    (DENSE_RANK() OVER (ORDER BY `{fact_date_col_phys}` DESC) = 2) "
-                f"AS is_yesterday_snapshot,"
-            )
-        # remove trailing comma on last addition
-        source_lines[-1] = source_lines[-1].rstrip(",")
-        source_lines.append(f"  FROM {fq_table(fact_name)} f")
-        source_value = "|\n" + "\n".join(source_lines)
-    else:
-        source_value = fq_table(fact_name)
+    # Source: plain table reference. Agent adds snapshot-flag columns
+    # (is_latest_snapshot, etc.) as inline SQL when any measure needs them.
+    fact_date_hint = detect_fact_date_column(fact, doc)
+    source_value = source_override or fq_table(fact_name)
 
     mv: dict = {
         "version": "1.1",
         "comment": (f"Generated from Power BI .pbit tabular model. "
                     f"Fact table: {physical_table(fact_name)} ({style} style)."),
-        "source": source_override or source_value,
+        "source": source_value,
+        "_fact_date_hint": fact_date_hint,  # consumed by emit_yaml for the agent's reference
     }
     if joins:
         mv["joins"] = joins
     mv["dimensions"] = dimensions
     mv["measures"] = measures
-
-    if fwd_refs_inlined:
-        warnings.append(f"forward measure references: {fwd_refs_inlined} inlined to satisfy backward-only resolution")
 
     return mv, warnings
 
@@ -1452,7 +534,6 @@ def emit_table_ddl(
             continue
         physical = (kimball_table(t["name"], is_fact=(t["name"] == fact_orig), fact_suffix=fact_suffix)
                     if style == "kimball" else t["name"])
-        # Dedupe column names within the table (Spark forbids dupes)
         seen_names: dict[str, int] = {}
         col_lines: list[str] = []
         for c in cols:
@@ -1483,15 +564,16 @@ def emit_table_ddl(
 
 
 # ----------------------------------------------------------------------------
-# YAML emission
+# YAML emission (scaffold — agent fills measure exprs/comments)
 # ----------------------------------------------------------------------------
 
 def _yaml_scalar(v: str) -> str:
-    if v == "":
+    """Quote a value if needed; else emit raw. Conservative — quote when the
+    value contains YAML special chars or starts with one."""
+    if not v:
         return '""'
-    needs_quote = any(c in v for c in ":#&*!|>'\"%@`{},[]") or v.strip() != v
-    if needs_quote or "\n" in v:
-        return json.dumps(v, ensure_ascii=False)
+    if re.search(r"[:\#\&\*\!\|\>\?\{\}\[\],\"\'%@`]", v) or v[0] in (" ", "-", "?"):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return v
 
 
@@ -1501,8 +583,8 @@ def emit_yaml(mv: dict) -> str:
     if mv.get("comment"):
         out.append(f"comment: {_yaml_scalar(mv['comment'])}")
     src = mv["source"]
-    if src.startswith("|"):
-        # multi-line literal block
+    if isinstance(src, str) and src.startswith("|"):
+        # multi-line literal block (unused by the scaffolder; agent may add one)
         out.append("source: |")
         for line in src.splitlines()[1:]:
             out.append(line)
@@ -1516,51 +598,57 @@ def emit_yaml(mv: dict) -> str:
             out.append(f"  - name: {_yaml_scalar(j['name'])}")
             out.append(f"    source: {_yaml_scalar(j['source'])}")
             out.append(f"    on: {_yaml_scalar(j['on'])}")
+
     out.append("dimensions:")
     for d in mv["dimensions"]:
-        # `comment:` and `synonyms:` on dimensions require a workspace whose
-        # metric-view serde is v1.1+ (DBR 17.2+). On an older serde (v1.0 — used
-        # by DBR 16.4–17.1) the parser only knows `name/expr/window` and rejects
-        # the YAML with:
-        #   "Unrecognized field 'synonyms' (class … v10.Column), not marked as
-        #    ignorable (3 known properties: 'window', 'name', 'expr')"
-        # If you hit that error, your DBR is < 17.2 — strip `comment:` and
-        # `synonyms:` from every dimension here (or upgrade DBR). Measures'
-        # `comment:`/`synonyms:` work all the way back to v1.1 measures.
+        # `comment:` and `synonyms:` on dimensions require the v1.1+ metric-view
+        # serde (DBR 17.2+). Older serdes only know `name/expr/window` on dims.
+        # If you hit "Unrecognized field 'synonyms' (class … v10.Column)" on
+        # CREATE VIEW, re-run with --no-dim-metadata.
         out.append(f"  - name: {_yaml_scalar(d['name'])}")
         out.append(f"    expr: {_yaml_scalar(d['expr'])}")
         if d.get("comment"):
             out.append(f"    comment: {_yaml_scalar(d['comment'])}")
         else:
-            out.append(f"    # comment: TODO — agent should LLM-author a one-line description")
-            out.append(f"    #          (what this dimension represents in business terms).")
+            out.append(f"    # comment: AGENT_AUTHOR — replace with a one-line business description")
         d_syns = [s for s in (d.get("synonyms") or []) if s and s != d["name"]]
         if d_syns:
             out.append(f"    synonyms:")
             for syn in d_syns:
                 out.append(f"      - {_yaml_scalar(syn)}")
+
+    # Measures: scaffold only. The agent fills in expr + comment, replacing the
+    # AGENT_TRANSLATE_DAX / AGENT_AUTHOR placeholders.
     out.append("measures:")
-    for m in mv["measures"]:
-        if m.get("_warn"):
-            out.append(f"  # TODO manual review — original DAX:")
-            for line in (m.get("_dax") or "").splitlines() or [""]:
-                out.append(f"  #   {line}")
-            out.append(f"  # warnings: {'; '.join(m['_warn'])}")
-            # Direct future-Claude / human editor to the right hand-fix shape.
-            warns_joined = " ".join(m["_warn"])
-            if any(kw in warns_joined for kw in ("TOTALYTD", "SAMEPERIODLASTYEAR", "DATEADD", "PARALLELPERIOD", "PREVIOUSDAY", "PREVIOUSMONTH", "PREVIOUSQUARTER", "PREVIOUSYEAR", "DATESYTD")):
-                out.append(f"  # HOW-TO: rewrite this as a `window:` block. The `expr:` MUST reference")
-                out.append(f"  #   the BASE measure via MEASURE(), e.g.  expr: \"MEASURE(`Total COGS`)\"")
-                out.append(f"  #   — DO NOT re-inline `SUM(...)+SUM(...)` here (breaks single-source-of-truth).")
-                out.append(f"  #   For year-trailing windows add a DATE-typed dim like `DATE_TRUNC('YEAR', date.\\`date\\`)`.")
-                out.append(f"  #   See SKILL.md non-negotiable default #3 and references/dax-to-sql-patterns.md § PoP patterns.")
+    fact_date_hint = mv.get("_fact_date_hint")
+    if fact_date_hint:
+        out.append(f"  # Fact date column hint (use for snapshot flags if needed): `{fact_date_hint}`")
+    out.append(f"  # AGENT INSTRUCTIONS:")
+    out.append(f"  #   For each measure below, the original DAX is preserved as a YAML")
+    out.append(f"  #   comment block. Replace `AGENT_TRANSLATE_DAX` with the metric-view SQL")
+    out.append(f"  #   translation, and `AGENT_AUTHOR` with a one-line business comment.")
+    out.append(f"  #   Translation cookbook: references/dax-to-sql-patterns.md")
+    out.append(f"  #")
+    out.append(f"  #   If any measure uses LASTDATE / FIRSTDATE / DATEADD(...,-1,DAY) as a")
+    out.append(f"  #   CALCULATE filter, you MUST also replace the `source:` above with an")
+    out.append(f"  #   inline SELECT that adds the corresponding boolean snapshot flag column")
+    out.append(f"  #   (is_latest_snapshot, is_first_snapshot, is_yesterday_snapshot).")
+    out.append(f"  #   See SKILL.md § Snapshot flags for the standard pattern.")
+    n = len(mv["measures"])
+    for i, m in enumerate(mv["measures"], start=1):
+        src_table = m.get("_source_table") or "?"
+        out.append("")
+        out.append(f"  # === Measure {i}/{n}: {m['name']} (PBI table: {src_table}) ===")
+        dax_lines = (m.get("_dax") or "").splitlines() or [""]
+        out.append(f"  # Original DAX:")
+        for dl in dax_lines:
+            out.append(f"  #   {dl}")
         out.append(f"  - name: {_yaml_scalar(m['name'])}")
-        out.append(f"    expr: {_yaml_scalar(m['expr'])}")
+        out.append(f"    expr: AGENT_TRANSLATE_DAX")
         if m.get("comment"):
             out.append(f"    comment: {_yaml_scalar(m['comment'])}")
         else:
-            out.append(f"    # comment: TODO — agent should LLM-author a one-line description")
-            out.append(f"    #          based on the DAX expression and business context.")
+            out.append(f"    comment: AGENT_AUTHOR")
         syns = [s for s in (m.get("synonyms") or []) if s and s != m["name"]]
         if syns:
             out.append(f"    synonyms:")
@@ -1570,14 +658,17 @@ def emit_yaml(mv: dict) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Verification (levels 3, 5, 6)
+# Verification (mechanical checks only — translation correctness is the
+# agent's responsibility, validated via the live compile-check SQL block)
 # ----------------------------------------------------------------------------
 
 _BACKTICK_REF = re.compile(r"(?:(\w+)\.)?`([^`]+)`")
-_MEASURE_REF = re.compile(r"\bMEASURE\s*\(\s*`([^`]+)`\s*\)", re.IGNORECASE)
 
 
 def verify_static(doc: dict, mv: dict, style: str, fact_orig: str) -> list[str]:
+    """Static schema check on the dimensions only. Measure exprs are agent-filled
+    placeholders at scaffold time, so we can't verify them statically here —
+    use --emit-verify-sql for that, which runs after the agent fills them in."""
     issues: list[str] = []
 
     def physical(name: str) -> str:
@@ -1587,7 +678,7 @@ def verify_static(doc: dict, mv: dict, style: str, fact_orig: str) -> list[str]:
     fact_cols: set[str] = set()
     if fact:
         fact_cols = {physical(c["name"]) for c in fact.get("columns", [])}
-        # Augmented columns from SQL source (when LASTDATE/FIRSTDATE detected)
+        # Snapshot flags the agent may add — known ok.
         fact_cols.update({"is_latest_snapshot", "is_first_snapshot", "is_yesterday_snapshot"})
 
     join_aliases: dict[str, str] = {}
@@ -1606,17 +697,8 @@ def verify_static(doc: dict, mv: dict, style: str, fact_orig: str) -> list[str]:
         if t:
             join_cols[alias] = {physical(c["name"]) for c in t.get("columns", [])}
 
-    measure_names: set[str] = {m["name"] for m in mv.get("measures", [])}
-
     def check_expr(expr: str, label: str) -> None:
-        for mt in _MEASURE_REF.finditer(expr):
-            x = mt.group(1)
-            if x not in measure_names:
-                issues.append(f"{label}: MEASURE(`{x}`) — no such declared measure")
-        work = _MEASURE_REF.sub("", expr)
-        for ub in re.finditer(r"\[([^\]]+)\]", work):
-            issues.append(f"{label}: unresolved bare bracket [{ub.group(1)}] — manual rewrite needed")
-        for mt in _BACKTICK_REF.finditer(work):
+        for mt in _BACKTICK_REF.finditer(expr):
             alias, col = mt.group(1), mt.group(2)
             if alias:
                 if alias not in join_cols:
@@ -1629,8 +711,6 @@ def verify_static(doc: dict, mv: dict, style: str, fact_orig: str) -> list[str]:
 
     for d in mv.get("dimensions", []):
         check_expr(d.get("expr", ""), f"dim {d['name']!r}")
-    for m in mv.get("measures", []):
-        check_expr(m.get("expr", ""), f"measure {m['name']!r}")
     return issues
 
 
@@ -1655,19 +735,27 @@ def verify_structural(doc: dict, mv: dict, fact_orig: str) -> list[str]:
     return issues
 
 
-def emit_verify_sql(mv: dict, catalog_schema: str | None, view_full_name: str) -> str:
+def emit_verify_sql(mv: dict, view_full_name: str) -> str:
+    """Verification SQL — commented out by default. The agent should uncomment
+    after filling in measure exprs, then run via execute_sql to live-compile-check
+    every measure against the deployed view."""
     lines: list[str] = []
     lines.append("-- ============================================================")
-    lines.append("-- VERIFICATION: compile-check each measure against the view.")
-    lines.append("-- Run after the CREATE TABLE / CREATE VIEW above succeed.")
+    lines.append("-- VERIFICATION (LIVE COMPILE CHECK)")
+    lines.append("--")
+    lines.append("-- Uncomment AFTER the agent has filled in every measure's `expr:`.")
+    lines.append("-- Run via execute_sql to catch:")
+    lines.append("--   • MEASURE() FILTER (WHERE) — engine rejects this; inline the agg")
+    lines.append("--   • BINARY_OP_DIFF_TYPES — INTERVAL '-1' YEAR with INT order dim")
+    lines.append("--   • Unresolved column refs / missing join aliases")
     lines.append("-- ============================================================")
     lines.append("")
-    lines.append(f"DESCRIBE EXTENDED {view_full_name};")
+    lines.append(f"-- DESCRIBE EXTENDED {view_full_name};")
     lines.append("")
     for m in mv.get("measures", []):
         safe_name = m["name"].replace("`", "``")
         lines.append(f"-- {m['name']}")
-        lines.append(f"SELECT MEASURE(`{safe_name}`) AS m FROM {view_full_name} LIMIT 1;")
+        lines.append(f"-- SELECT MEASURE(`{safe_name}`) AS m FROM {view_full_name} LIMIT 1;")
         lines.append("")
     return "\n".join(lines)
 
@@ -1678,17 +766,21 @@ def emit_verify_sql(mv: dict, catalog_schema: str | None, view_full_name: str) -
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Convert a Power BI .pbit into Databricks UC metric view YAML (+ optional DDL).",
+        description="Scaffold a Databricks UC metric view from a Power BI .pbit. "
+                    "Agent translates DAX→SQL; this script does the structural plumbing.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples (kimball default — Genie/dbt idiomatic):\n"
-            "  dax_to_metric_view.py model.pbit --catalog-schema main.sales --emit-ddl --out sales.sql\n"
+            "  dax_to_metric_view.py model.pbit --catalog-schema main.sales --emit-ddl --out scaffold.sql\n"
             "  dax_to_metric_view.py model.pbit --catalog-schema main.sales --fact-suffix profitability\n"
             "\n"
             "Source-fidelity (preserve PBI names verbatim — needs Delta column mapping):\n"
             "  dax_to_metric_view.py model.pbit --style fidelity --source main.sales.fact_sales\n"
             "\n"
-            "Schema-only output by default. Data ingestion is a separate step.\n"
+            "Output is a SCAFFOLD: dimensions/joins/synonyms are populated mechanically;\n"
+            "each measure has the original DAX preserved as YAML comments and\n"
+            "expr: AGENT_TRANSLATE_DAX / comment: AGENT_AUTHOR placeholders for the\n"
+            "agent (LLM) running this skill to fill in. See SKILL.md for the workflow.\n"
             "\n"
             "Get a .pbit from a .pbix: open in PBI Desktop → File → Export → Power BI Template.\n"
         ),
@@ -1705,19 +797,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="Emit CREATE TABLE DDL for every table (schema-only) before the metric view.")
     ap.add_argument("--out", help="Write to file (default: stdout)")
     ap.add_argument("--verify", action="store_true",
-                    help="Run static schema check (level 3) + structural diff (level 6).")
+                    help="Run static schema check (dimensions only) + structural diff.")
     ap.add_argument("--emit-verify-sql", action="store_true",
-                    help="Append a verification SQL block (level 5) — one SELECT MEASURE() per measure.")
-    ap.add_argument("--strict", action="store_true",
-                    help="Exit non-zero if --verify found issues OR any measure was flagged.")
+                    help="Append a verification SQL block (commented out) — agent uncomments after filling exprs.")
     ap.add_argument("--no-dim-metadata", action="store_true",
                     help=("Strip `comment:` and `synonyms:` from every dimension before "
                           "emitting the YAML. Use this if your DBR is < 17.2 — the older "
-                          "metric-view serde (v1.0) only knows `name/expr/window` on dims "
-                          "and rejects the YAML with `Unrecognized field 'synonyms' "
-                          "(class … v10.Column)`. Measures still get full metadata. "
-                          "DBR 17.2+ should leave this off — dim comment+synonyms persist "
-                          "as column metadata and surface in Genie/AI/BI search."))
+                          "metric-view serde rejects dim comment/synonyms with "
+                          "`Unrecognized field 'synonyms' (class … v10.Column)`. Measures "
+                          "still get full metadata."))
     args = ap.parse_args(argv)
 
     path = Path(args.input)
@@ -1760,6 +848,13 @@ def main(argv: list[str] | None = None) -> int:
                  if args.style == "kimball" else fact_orig)
     metric_view_name = f"{cs}.{fact_phys}_metrics"
     parts.append(
+        f"-- =============================================================\n"
+        f"-- AGENT: this YAML is a SCAFFOLD. Replace every AGENT_TRANSLATE_DAX\n"
+        f"-- with the metric-view SQL translation of the original DAX (preserved\n"
+        f"-- as YAML comments above each measure). Replace each AGENT_AUTHOR\n"
+        f"-- with a one-line business-meaning comment.\n"
+        f"-- See references/dax-to-sql-patterns.md for the cookbook.\n"
+        f"-- =============================================================\n"
         f"CREATE OR REPLACE VIEW {metric_view_name}\n"
         f"WITH METRICS\n"
         f"LANGUAGE YAML\n"
@@ -1767,7 +862,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.emit_verify_sql:
-        parts.append(emit_verify_sql(mv, args.catalog_schema, metric_view_name))
+        parts.append(emit_verify_sql(mv, metric_view_name))
 
     output = "\n".join(parts)
     if args.out:
@@ -1785,30 +880,27 @@ def main(argv: list[str] | None = None) -> int:
         src_measures = sum(len(t.get("measures", [])) for t in src_real_tables)
         print(f"  source: {len(src_real_tables)} tables, {src_measures} measures", file=sys.stderr)
         print(f"  output: {len(mv.get('dimensions', []))} dimensions, "
-              f"{len(mv.get('measures', []))} measures, "
+              f"{len(mv.get('measures', []))} measures (all AGENT_TRANSLATE_DAX), "
               f"{len(mv.get('joins', []))} joins", file=sys.stderr)
-        print(f"  Level 3 (static schema check): {len(static_issues)} issue(s)", file=sys.stderr)
+        print(f"  Static schema check (dimensions only): {len(static_issues)} issue(s)", file=sys.stderr)
         for i in static_issues[:20]:
             print(f"    • {i}", file=sys.stderr)
         if len(static_issues) > 20:
             print(f"    ... +{len(static_issues) - 20} more", file=sys.stderr)
-        print(f"  Level 6 (structural diff): {len(structural_issues)} issue(s)", file=sys.stderr)
+        print(f"  Structural diff: {len(structural_issues)} issue(s)", file=sys.stderr)
         for i in structural_issues:
             print(f"    • {i}", file=sys.stderr)
         if args.emit_verify_sql:
-            print(f"  Level 5 (live compile): verify SQL appended to output — run via execute_sql.",
+            print(f"  Live compile check: verify SQL appended (commented out — agent uncomments after translation).",
                   file=sys.stderr)
 
     if warnings:
-        print("\n=== Diagnostic (translation flags) ===", file=sys.stderr)
+        print("\n=== Scaffolder warnings ===", file=sys.stderr)
         for w in warnings:
             print(f"  • {w}", file=sys.stderr)
-        print(f"  ({len(warnings)} item(s) need manual review)", file=sys.stderr)
 
-    if args.strict and (warnings or static_issues or structural_issues):
-        return 2
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
