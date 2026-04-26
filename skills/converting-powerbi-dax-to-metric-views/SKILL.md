@@ -40,7 +40,8 @@ The converter's output is a directly-runnable SQL file: `CREATE TABLE` × N + on
 Self-contained reference for the YAML inside `CREATE VIEW … WITH METRICS LANGUAGE YAML AS $$ … $$`. Sufficient for everything the PBI converter emits and every hand-edit this skill describes.
 
 ### Prerequisites
-- Databricks Runtime **17.2+** (YAML `version: "1.1"`). DBR 16.4–17.1 supports the older `version: "0.1"` (used only for window measures, see below).
+- Databricks Runtime **17.2+**. **Always use YAML `version: "1.1"`** — for everything (dimensions, measures, window measures alike).
+- On DBR < 17.2, dim `comment:`/`synonyms:` aren't recognized by the older serde — re-run the converter with `--no-dim-metadata` to strip them. Measures keep full metadata regardless.
 - SQL warehouse with `CAN USE`; `SELECT` on source tables; `CREATE TABLE`/`USE SCHEMA` in the target schema.
 
 ### Top-level structure
@@ -126,10 +127,10 @@ Rules: the fact is always `source` in `on:`; joined tables are referenced by the
 
 ### Window measures (period-over-period, running totals)
 
-Window measures use **`version: "0.1"`** (still experimental as of DBR 17.2; v1.1 doesn't subsume it). Add a `window:` block to a measure:
+Window measures are still experimental but use the standard YAML `version: "1.1"` like everything else. Add a `window:` block to a measure:
 
 ```yaml
-version: "0.1"               # Required for window measures
+version: "1.1"
 ...
 measures:
   - name: Total Revenue
@@ -234,7 +235,7 @@ Don't use for:
    - [ ] **`expr:` is `MEASURE(\`Base Measure\`)`, NOT a re-inlined SUM/+SUM expression.** (See non-negotiable default #3.)
    - [ ] **`CASE WHEN <numeric> THEN ... END`** patterns the converter emitted from `IF([SPLY], var/SPLY, BLANK())` are NOT valid SQL — `CASE WHEN` requires a boolean. Replace with `MEASURE(\`var\`) / NULLIF(MEASURE(\`SPLY\`), 0)`.
    - [ ] If the measure references columns from a joined dim (e.g., `scenario`, `date`), qualify with the join alias (`scenario.\`scenario\``, not `\`scenario\``).
-   - [ ] Window measures require `version: 0.1` at the top of the YAML. Top-level `comment:` is NOT valid in v0.1 — use YAML `#` comments instead.
+   - [ ] Always use `version: "1.1"` at the top of the YAML — for window measures and everything else.
    - [ ] If using `range: trailing N year`, the `order:` dim MUST be DATE (not INT) — add a `Year Start` dim as `DATE_TRUNC('YEAR', date.\`date\`)`.
 
 6. **Wire data ingestion as a separate step.** The tables are empty. Use Lakeflow Connect, PBI Desktop → Export → CSV → `COPY INTO`, or a Spark job. Do NOT auto-emit `INSERT INTO` SQL — that's a separate task the user must explicitly request.
@@ -257,6 +258,7 @@ Don't use for:
 | **`--verify`** | Run static schema check + structural diff against the source PBIT. Reports unresolved column refs, alias mismatches, count drift to stderr. |
 | **`--emit-verify-sql`** | Append a verification SQL block — one `SELECT MEASURE(\`name\`) FROM view LIMIT 1` per measure. Run this against Databricks to compile-check every measure expression. |
 | `--strict` | Exit non-zero if `--verify` found issues OR any measure was flagged for manual review. CI guard. |
+| **`--no-dim-metadata`** | Strip `comment:` and `synonyms:` from every dimension. Use this if your workspace runs a metric-view serde older than v1.1 (DBR < 17.2) — those parsers know only `name/expr/window` on dims and reject the YAML with `Unrecognized field 'synonyms' (class … v10.Column), not marked as ignorable (3 known properties: 'window', 'name', 'expr')`. Measures keep full metadata (their schema is stable across older serdes). DBR 17.2+ should leave this off. |
 
 ## Verification levels
 
@@ -321,7 +323,9 @@ Every emitted dimension carries a `synonyms:` list. PBI columns are referenced i
 
 - If both forms equal `name:` (rare), the `synonyms:` block is omitted entirely.
 
-Databricks metric views (DBR 17.2+) accept `synonyms:` per **measure and dimension** as a list. Genie / AI/BI consumers use it to resolve user queries to the right object when the migrated `name:` differs from what was typed. The DAX bracket / qualified form is critical: anyone reading the original PBI report or DAX code will type that, and synonyms make the migrated object findable. The converter populates this **mechanically** for every measure and dimension — pure 1:1 mapping from the source PBI metadata, with the dedup rule above.
+Databricks metric views accept `synonyms:` per **measure and dimension** as a list. Genie / AI/BI consumers use it to resolve user queries to the right object when the migrated `name:` differs from what was typed. The DAX bracket / qualified form is critical: anyone reading the original PBI report or DAX code will type that, and synonyms make the migrated object findable. The converter populates this **mechanically** for every measure and dimension — pure 1:1 mapping from the source PBI metadata, with the dedup rule above.
+
+**DBR version note:** Measure `synonyms:`/`comment:` work on every recent DBR. **Dimension** `synonyms:`/`comment:` require the **v1.1 metric-view serde (DBR 17.2+)**; older runtimes (DBR 16.4–17.1, internal class `v10.Column`) only know `name/expr/window` on dims and reject the YAML with `Unrecognized field 'synonyms' … 3 known properties: 'window', 'name', 'expr'`. If you hit that error, either upgrade DBR or re-run the converter with `--no-dim-metadata` to strip dim `comment:`/`synonyms:` (measures unaffected).
 
 ### `comment:` — LLM-authored by the agent (NOT rule-based)
 
@@ -427,6 +431,7 @@ These are intentionally UI-only or non-aggregable — they aren't real KPIs and 
 | `BINARY_OP_DIFF_TYPES` on `INTERVAL '-1' YEAR` | The window's `order` dim is INT — change it to `DATE_TRUNC('YEAR', date)`. |
 | `MEASURE(\`X\`) FILTER (WHERE ...)` rejected by engine | `MEASURE()` doesn't support FILTER clause. Inline the underlying agg expression instead. |
 | Aggregating a STRING column (e.g. revenue stored as text) | The DDL emits the original type. Either fix the DDL/cast on ingest, or wrap the column in `try_cast(... AS DOUBLE)` inside the SQL `source:`. |
+| `[METRIC_VIEW_INVALID_VIEW_DEFINITION] Unrecognized field "synonyms" (class … v10.Column), not marked as ignorable (3 known properties: "window", "name", "expr")` | Your DBR is on a metric-view serde older than v1.1 (DBR < 17.2). That parser only knows `name/expr/window` on dimensions. Re-run the converter with `--no-dim-metadata` to strip dim `comment:`/`synonyms:`. (Measures are unaffected.) Or upgrade DBR. |
 
 ## Files
 

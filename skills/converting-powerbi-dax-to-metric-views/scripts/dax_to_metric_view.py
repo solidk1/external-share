@@ -1518,6 +1518,15 @@ def emit_yaml(mv: dict) -> str:
             out.append(f"    on: {_yaml_scalar(j['on'])}")
     out.append("dimensions:")
     for d in mv["dimensions"]:
+        # `comment:` and `synonyms:` on dimensions require a workspace whose
+        # metric-view serde is v1.1+ (DBR 17.2+). On an older serde (v1.0 — used
+        # by DBR 16.4–17.1) the parser only knows `name/expr/window` and rejects
+        # the YAML with:
+        #   "Unrecognized field 'synonyms' (class … v10.Column), not marked as
+        #    ignorable (3 known properties: 'window', 'name', 'expr')"
+        # If you hit that error, your DBR is < 17.2 — strip `comment:` and
+        # `synonyms:` from every dimension here (or upgrade DBR). Measures'
+        # `comment:`/`synonyms:` work all the way back to v1.1 measures.
         out.append(f"  - name: {_yaml_scalar(d['name'])}")
         out.append(f"    expr: {_yaml_scalar(d['expr'])}")
         if d.get("comment"):
@@ -1701,6 +1710,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="Append a verification SQL block (level 5) — one SELECT MEASURE() per measure.")
     ap.add_argument("--strict", action="store_true",
                     help="Exit non-zero if --verify found issues OR any measure was flagged.")
+    ap.add_argument("--no-dim-metadata", action="store_true",
+                    help=("Strip `comment:` and `synonyms:` from every dimension before "
+                          "emitting the YAML. Use this if your DBR is < 17.2 — the older "
+                          "metric-view serde (v1.0) only knows `name/expr/window` on dims "
+                          "and rejects the YAML with `Unrecognized field 'synonyms' "
+                          "(class … v10.Column)`. Measures still get full metadata. "
+                          "DBR 17.2+ should leave this off — dim comment+synonyms persist "
+                          "as column metadata and surface in Genie/AI/BI search."))
     args = ap.parse_args(argv)
 
     path = Path(args.input)
@@ -1733,6 +1750,10 @@ def main(argv: list[str] | None = None) -> int:
             fact_suffix=args.fact_suffix,
         ))
 
+    if args.no_dim_metadata:
+        for d in mv.get("dimensions", []):
+            d.pop("comment", None)
+            d.pop("synonyms", None)
     yaml_body = emit_yaml(mv)
     cs = args.catalog_schema if args.catalog_schema else "<TODO_CATALOG.SCHEMA>"
     fact_phys = (kimball_table(fact_orig, is_fact=True, fact_suffix=args.fact_suffix)
