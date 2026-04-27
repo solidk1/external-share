@@ -1,6 +1,6 @@
 # DAX → Metric View SQL Translation Patterns
 
-This reference covers the **mechanisms** behind the converter's DAX→SQL translation: how CALCULATE filters become FILTER clauses, how snapshot flags get auto-injected into source SQL, how VAR/RETURN inlining works, and how to hand-fix the time-intel patterns the converter flags. For the at-a-glance table of which DAX constructs auto-translate vs. need manual rewrite, see the **Quick reference** and **Flagged for manual review** tables in `SKILL.md`.
+This reference is the **agent's translation cookbook** — the patterns the LLM applies when filling in `AGENT_TRANSLATE_DAX` placeholders in the scaffolded YAML. Covers: how CALCULATE filters become FILTER clauses, how snapshot flags get added to source SQL, how VAR/RETURN inlining works, and the time-intel patterns that need extra care. For the at-a-glance table of which DAX constructs map to which SQL forms, see the **Translation cookbook** table in `SKILL.md`.
 
 ## CALCULATE → FILTER (WHERE …)
 
@@ -11,14 +11,14 @@ This reference covers the **mechanisms** behind the converter's DAX→SQL transl
 | `CALCULATE(SUM('S'[Amt]), 'S'[Status] = "O")` | `SUM(\`Amt\`) FILTER (WHERE \`Status\` = 'O')` |
 | `CALCULATE(SUM('S'[Amt]), FILTER('S', 'S'[Date] >= "2024-01-01"))` | `SUM(\`Amt\`) FILTER (WHERE \`Date\` >= '2024-01-01')` |
 | `CALCULATE(SUM('S'[Amt]), 'S'[A]=1, 'S'[B]=2)` | `SUM(\`Amt\`) FILTER (WHERE \`A\`=1 AND \`B\`=2)` |
-| `CALCULATE(SUM('S'[Amt]), LASTDATE('Cal'[Date]))` | `SUM(\`Amt\`) FILTER (WHERE is_latest_snapshot)` (and source SQL is auto-augmented — see below) |
+| `CALCULATE(SUM('S'[Amt]), LASTDATE('Cal'[Date]))` | `SUM(\`Amt\`) FILTER (WHERE is_latest_snapshot)` (also augment `source:` SQL — see below) |
 
 ## LASTDATE / FIRSTDATE → snapshot flag in source SQL
 
-When the converter detects `LASTDATE(...)` or `FIRSTDATE(...)` as a CALCULATE filter, it does two things:
+When the original DAX has `LASTDATE(...)` or `FIRSTDATE(...)` as a CALCULATE filter, the agent does two things:
 
-1. Replaces the filter with `is_latest_snapshot` / `is_first_snapshot` in the measure expr.
-2. Rewrites the metric view's `source:` from a plain table reference to an inline SELECT that adds the boolean flag column:
+1. Replace the filter with `is_latest_snapshot` / `is_first_snapshot` in the measure expr.
+2. Rewrite the metric view's `source:` from a plain table reference to an inline SELECT that adds the boolean flag column:
 
 ```yaml
 source: |
@@ -54,20 +54,20 @@ CASE WHEN ((MEASURE(`Target`)) - (MEASURE(`Actual`))) < 0
 END
 ```
 
-If the converter cannot inline cleanly (e.g., `VAR x = SUMX(...) RETURN ...` where SUMX itself is unsupported), the original DAX is preserved as a comment and the measure is flagged.
+If you cannot inline cleanly (e.g., `VAR x = SUMX(...) RETURN ...` where SUMX itself has no clean SQL form), preserve the original DAX as a comment in the YAML and flag the measure for a manual rewrite.
 
 ## Forward-reference resolution
 
-Databricks metric views require backward-only `MEASURE(\`X\`)` references at view-creation time. The converter:
+Databricks metric views require backward-only `MEASURE(\`X\`)` references at view-creation time. When the agent fills in measures:
 
-1. Topologically sorts measures so all refs resolve.
-2. If a true cycle remains (rare), simple referenced expressions are inlined; complex ones get flagged with a warning.
+1. Order the measures so each `MEASURE(\`X\`)` ref points to a measure defined earlier in the YAML.
+2. If a true cycle exists (rare), inline the simpler referenced expression directly into the cycle-breaker.
 
-This mirrors what you'd do by hand and avoids `[UNRESOLVED_COLUMN]` errors at view creation.
+Getting the order wrong yields `[UNRESOLVED_COLUMN]` errors at CREATE VIEW time.
 
 ## Period-over-period patterns
 
-When a Power BI model defines several time-shift measures together (Monthly, YTD, MoM, YoY-by-month, QoQ-vs-LY), they **cannot all live in a single metric-view query** — the constraint is structural, not a converter limitation. Document this up front so consumers don't expect a 1:1 visual match.
+When a Power BI model defines several time-shift measures together (Monthly, YTD, MoM, YoY-by-month, QoQ-vs-LY), they **cannot all live in a single metric-view query** — the constraint is structural, not an LLM-translation limitation. Document this up front so consumers don't expect a 1:1 visual match.
 
 ### Three approaches, all valid
 
@@ -201,7 +201,7 @@ The window-function form is shorter, but you lose the metric view as a single so
 
 ## Snowflake / multi-hop joins
 
-The converter only emits **direct** relationships from the fact table to dim tables. Snowflake schemas (dim → outer-dim) need:
+The scaffolder only emits **direct** relationships from the fact table to dim tables. Snowflake schemas (dim → outer-dim) need:
 
 1. The metric view spec at v1.1 with **DBR 17.1+** (nested joins).
 2. Manually nest the second-hop join under the first in the YAML.
@@ -212,7 +212,7 @@ See SKILL.md § "Metric view YAML primer" → "Joins (snowflake, DBR 17.1+)".
 
 Metric views express joins as plain SQL `ON` clauses; cross-filter direction is implicit. If a DAX measure relied on bidirectional cross-filtering, the metric view will read it as one-directional. Verify totals match before publishing.
 
-## What the converter doesn't try
+## What this skill doesn't try
 
 - **Hidden dimensions / display folders.** All non-hidden columns become dimensions. Trim the YAML manually if you only want a subset exposed.
 - **Format strings / data type hints.** DAX format strings (`"#,##0.00"`) are stripped — metric views format at the consumer (BI tool) layer.
@@ -231,7 +231,7 @@ CALCULATE(
     DATEADD(LASTDATE('D_Calendar'[Date]), -1, DAY))
 ```
 
-The converter recognizes the `DATEADD(..., -1, DAY)` shape inside CALCULATE filters and emits an `is_yesterday_snapshot` flag in the source SQL using `DENSE_RANK()` (robust to weekend/holiday gaps):
+When the original DAX has `DATEADD(..., -1, DAY)` inside a CALCULATE filter, translate it to `is_yesterday_snapshot` and add the flag to the source SQL using `DENSE_RANK()` (robust to weekend/holiday gaps):
 
 ```yaml
 source: |
@@ -322,7 +322,7 @@ Don't bring the second fact in as a `joins:` entry to compute the AUR — joins 
 
 ## Tips
 
-- After running the converter, search the output for `# TODO` to find every flagged measure.
-- Run with `--strict` in CI/build scripts to fail when manual review is needed.
+- After running the scaffolder, search the YAML for `AGENT_TRANSLATE_DAX` and `AGENT_AUTHOR` — every occurrence is a placeholder the agent must fill before deployment.
 - Use `--fact-table` if the auto-pick (table with most measures) chooses the wrong table.
+- Use `--emit-verify-sql` to append a commented-out `SELECT MEASURE(\`X\`) FROM view LIMIT 1` block; uncomment after filling in expressions, then run via `execute_sql` for a live compile-check.
 - If a STRING column is used numerically in DAX (revenue stored as text — happens more than you'd think), either fix the source column on ingest, or wrap it in `try_cast(... AS DOUBLE) AS col_num` inside the metric view's `source:` SQL and point measure exprs at the new column.

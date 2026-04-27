@@ -9,7 +9,7 @@ description: Use when migrating a Power BI semantic model to Databricks Unity Ca
 
 Migrate the structure of a Power BI tabular model into Databricks UC: physical table DDL + a UC metric view on top.
 
-**This is a hybrid skill: the script scaffolds, the agent translates.**
+**The script scaffolds, the agent translates.** Pure-LLM design — no regex DAX→SQL translator. The script handles only the mechanical work (parsing, joins, dim emission, kimball renames, synonyms); every measure expression and comment is written by the LLM applying the skill.
 
 The bundled `dax_to_metric_view.py` parses a **`.pbit`** (Power BI Template — a ZIP containing the full TMSL JSON), picks a fact table, builds star-schema joins from active relationships, and emits a runnable SQL file with:
 

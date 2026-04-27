@@ -1,6 +1,6 @@
-# Getting a `.pbit` for the converter
+# Getting a `.pbit` for the scaffolder
 
-The converter takes **only `.pbit`** (Power BI Template). Everything below is about getting one.
+The scaffolder takes **only `.pbit`** (Power BI Template). Everything below is about getting one.
 
 ## You already have a `.pbix`
 
@@ -8,7 +8,7 @@ The converter takes **only `.pbit`** (Power BI Template). Everything below is ab
 PBI Desktop → File → Export → Power BI Template (.pbit)
 ```
 
-That's it. The `.pbit` is dropped next to your `.pbix`. PBI Desktop strips data and serializes the model as `DataModelSchema` JSON inside the ZIP — exactly what the converter reads.
+That's it. The `.pbit` is dropped next to your `.pbix`. PBI Desktop strips data and serializes the model as `DataModelSchema` JSON inside the ZIP — exactly what the scaffolder reads.
 
 ## You already have a `.pbit`
 
@@ -36,7 +36,7 @@ For Premium / PPU workspaces with the XMLA endpoint, you can also use Tabular Ed
 
 ## Why `.pbit` and not `.pbix`
 
-A `.pbix` stores the model in a single binary partition (`DataModel`) that is XPRESS9-compressed Analysis Services tabular backup. The format is undocumented; community readers (pbixray, etc.) reverse-engineer it incompletely. In particular, **base columns from M-loaded tables are routinely missed** — for example, a typical `D_Calendar` with a `Date` PK and several Year/Quarter/Day source columns will only expose its DAX-calculated columns, leaving the converter blind to half the schema.
+A `.pbix` stores the model in a single binary partition (`DataModel`) that is XPRESS9-compressed Analysis Services tabular backup. The format is undocumented; community readers (pbixray, etc.) reverse-engineer it incompletely. In particular, **base columns from M-loaded tables are routinely missed** — for example, a typical `D_Calendar` with a `Date` PK and several Year/Quarter/Day source columns will only expose its DAX-calculated columns, leaving the scaffolder blind to half the schema.
 
 A `.pbit` has the **same metadata as plain JSON** in `DataModelSchema`:
 - All tables (calculated, M-loaded, hybrid)
@@ -44,11 +44,11 @@ A `.pbit` has the **same metadata as plain JSON** in `DataModelSchema`:
 - All measures with full DAX expressions
 - All relationships, including isActive and crossFilteringBehavior
 
-The converter parses this JSON with `zipfile + json` from the Python stdlib — no third-party deps.
+The scaffolder parses this JSON with `zipfile + json` from the Python stdlib — no third-party deps.
 
-## What the converter reads from the `.pbit`
+## What the scaffolder reads from the `.pbit`
 
-The DataModelSchema JSON follows the [TMSL spec](https://learn.microsoft.com/en-us/analysis-services/tmsl/tabular-model-scripting-language-tmsl-reference). The converter uses:
+The DataModelSchema JSON follows the [TMSL spec](https://learn.microsoft.com/en-us/analysis-services/tmsl/tabular-model-scripting-language-tmsl-reference). The scaffolder uses:
 
 | Field | TMSL path |
 |-------|-----------|
@@ -62,11 +62,11 @@ It ignores (by design): M / Power Query expressions (the M source code), partiti
 ## Edge cases
 
 - **Hidden columns** (`isHidden=true`) are excluded from the metric view's `dimensions:` list but still emitted in DDL — that way joins still work and consumers can selectively expose more.
-- **Calculated tables** (built via `= CALENDAR(...)` etc.) come through with their materialized columns. The converter detects these via `partitions[].source.type == "calculated"` and emits DDL the same way.
-- **Calculated columns** (with a `expression` field) come through with their type metadata; their DAX is preserved as a comment in DDL — but they are not auto-translated, since the metric view computes calc-col-equivalent values via measures or dimension expressions.
-- **Multi-line measure expressions** are stored in TMSL as a JSON array; the converter joins them with newlines before translating.
+- **Calculated tables** (built via `= CALENDAR(...)` etc.) come through with their materialized columns. The scaffolder detects these via `partitions[].source.type == "calculated"` and emits DDL the same way.
+- **Calculated columns** (with a `expression` field) come through with their type metadata; their DAX is preserved as a comment in DDL — and the agent translates them as needed alongside the regular measures, since the metric view computes calc-col-equivalent values via measures or dimension expressions.
+- **Multi-line measure expressions** are stored in TMSL as a JSON array; the scaffolder joins them with newlines before translating.
 
 ## Limitations
 
-- DAX measure expressions come through verbatim — the converter normalizes whitespace and strips DAX comments before translating, but does not "interpret" arbitrary functions. If a measure uses something exotic (e.g., a calculation group selector or an obscure DAX function not in the auto-translation table), the converter passes it through and flags it for manual review with the original DAX preserved as a YAML comment.
+- DAX measure expressions come through verbatim — the scaffolder normalizes whitespace and strips DAX comments before translating, but does not "interpret" arbitrary functions. If a measure uses something exotic (e.g., a calculation group selector or an obscure DAX function not in the auto-translation table), the scaffolder passes it through and flags it for manual review with the original DAX preserved as a YAML comment.
 - The translator does NOT know which DAX measures are flagged hidden — all measures are emitted. Trim the YAML manually if you only want a subset exposed.
