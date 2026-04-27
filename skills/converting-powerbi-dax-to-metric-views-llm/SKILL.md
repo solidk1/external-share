@@ -7,21 +7,14 @@ description: Use when migrating a Power BI semantic model to Databricks Unity Ca
 
 ## Overview
 
-Migrate the structure of a Power BI tabular model into Databricks UC: physical table DDL + a UC metric view on top.
+Migrate the structure of a Power BI tabular model into Databricks UC: physical table DDL + a UC metric view on top. **The script scaffolds, the agent translates.** No regex DAX→SQL translator — the script does the mechanical work (parse `.pbit`, pick fact, build star-schema joins, emit Kimball DDL, populate `source`/`joins`/`dimensions`/`synonyms`); the agent does what regex does poorly (DAX semantics, time intel, business meaning).
 
-**The script scaffolds, the agent translates.** Pure-LLM design — no regex DAX→SQL translator. The script handles only the mechanical work (parsing, joins, dim emission, kimball renames, synonyms); every measure expression and comment is written by the LLM applying the skill.
+The scaffolder emits:
+- `CREATE TABLE IF NOT EXISTS` DDL (Kimball-renamed, schema-only) for every real table
+- A `CREATE OR REPLACE VIEW … WITH METRICS LANGUAGE YAML AS $$ … $$` scaffold where each measure is a placeholder: original DAX preserved as YAML comments, `expr: AGENT_TRANSLATE_DAX`, `comment: AGENT_AUTHOR`
+- An optional verify SQL block (commented out) — one `SELECT MEASURE(\`X\`) FROM view LIMIT 1` per measure
 
-The bundled `dax_to_metric_view.py` parses a **`.pbit`** (Power BI Template — a ZIP containing the full TMSL JSON), picks a fact table, builds star-schema joins from active relationships, and emits a runnable SQL file with:
-
-- Kimball-renamed `CREATE TABLE` DDL (one per real table, schema-only)
-- A `CREATE OR REPLACE VIEW … WITH METRICS LANGUAGE YAML AS $$ … $$` SCAFFOLD where:
-  - `source`, `joins`, `dimensions` are fully populated mechanically
-  - `synonyms:` are populated mechanically on every measure and dimension (1:1 PBI bracket / qualified form, deduped against `name:`)
-  - **Each measure is a placeholder**: original DAX preserved as YAML comments, `expr: AGENT_TRANSLATE_DAX`, `comment: AGENT_AUTHOR`
-
-The **agent applying this skill (LLM) does the actual DAX→SQL translation**: reads each measure's preserved DAX, translates to metric-view SQL using `references/dax-to-sql-patterns.md` as the cookbook, LLM-authors the comment, and replaces the placeholders. Then the agent optionally uncomments the appended verify SQL block and runs it via `execute_sql` to live-compile-check every measure.
-
-This split is intentional. The script handles what regex does well (parsing, naming, scaffolding); the LLM handles what regex does poorly (DAX semantics, time intelligence, business meaning). The result: 100% of measures land with LLM-quality translation + comments, no `# TODO manual review` rows left behind.
+The agent then fills in every placeholder using `references/dax-to-sql-patterns.md` as the cookbook, uncomments the verify block, and runs it via `execute_sql` to live-compile-check every measure.
 
 ## Three non-negotiable defaults
 
@@ -29,23 +22,26 @@ This split is intentional. The script handles what regex does well (parsing, nam
 Tables: lowercase, `dim_*` prefix on every dim, `fact_*` prefix on the fact table. Columns: lowercase snake_case, no spaces or special chars. This is what Genie / dbt / Fabric / AI-generated SQL all expect. No Delta `columnMapping.mode` needed.
 Use `--style fidelity` to preserve original PBI names (case + spaces + slashes) — but that requires column mapping mode and is harder for Genie/LLMs to query.
 
-**2. Schema-only output. Do NOT auto-load data.**
-The script emits CREATE TABLE DDL + the metric view CREATE VIEW. It never emits `INSERT INTO`. Data ingestion is a separate, explicit step (Lakeflow Connect, PBI Desktop → Export CSV → `COPY INTO`, custom Spark job). If the user asks for "convert to tables and metric views", that is the structure — don't load source data unless they explicitly say "load" / "populate" / "import the data".
+**2. Schema-only output. NEVER load data. Never overwrite existing tables.**
+The script emits `CREATE TABLE IF NOT EXISTS` DDL + `CREATE OR REPLACE VIEW`. It never emits `INSERT INTO`, never `CREATE OR REPLACE TABLE`, never `DROP TABLE`. If a table already exists, DDL is a no-op — data preserved. The view is safe to replace (holds no data).
 
-**3. Translate every measure — the agent does NOT skip placeholders.**
-Every `AGENT_TRANSLATE_DAX` and `AGENT_AUTHOR` placeholder in the scaffold MUST be filled by the agent before deployment. The "Constructs needing extra care during translation" table below lists DAX patterns that require judgment (DATEADD, USERELATIONSHIP, ALL, EARLIER, RANKX). For each: walk through `references/dax-to-sql-patterns.md` and apply the pattern — don't punt unless the construct is genuinely UI-only (see "What NOT to migrate"). Hand-fixed time-intel measures MUST use `MEASURE()` refs to base measures, not re-inlined SUMs:
+- **Never load source data** — not via this skill, not as a follow-up, not even if asked. Don't generate `INSERT INTO` / `COPY INTO` / `df.write` / "just populate a few rows for testing." Ingestion is a separate task — point the user at an ingestion skill (Lakeflow Connect, `COPY INTO`, Spark) and stop.
+- **Never drop or replace an existing table without explicit confirmation.** If a table exists with a different schema than the `.pbit` would produce, ask the user: keep the existing table (and adjust the YAML to its column names), or `DROP TABLE` and recreate? Don't issue `DROP TABLE` without explicit consent.
+
+**3. Translate every measure — no skipped placeholders.**
+Every `AGENT_TRANSLATE_DAX` and `AGENT_AUTHOR` placeholder MUST be filled before deployment. For DAX patterns requiring judgment (DATEADD, USERELATIONSHIP, ALL, EARLIER, RANKX), see "Constructs needing extra care" below; only skip if genuinely UI-only (see "What NOT to migrate").
+
+Time-intel measures MUST use `MEASURE()` refs, not re-inlined SUMs (single-source-of-truth — re-inlining forces N-place edits per component change):
 ```yaml
-# WRONG — re-inlined SUMs in a windowed measure (breaks single-source-of-truth)
+# WRONG
 - name: COGS SPLY
   expr: "SUM(`material_costs`)+SUM(`labor_costs_variable`)+SUM(`taxes`)+..."
   window: [{order: Year Start, range: trailing 1 year, semiadditive: last}]
-
-# RIGHT — references the existing Total COGS measure
+# RIGHT
 - name: COGS SPLY
   expr: "MEASURE(`Total COGS`)"
   window: [{order: Year Start, range: trailing 1 year, semiadditive: last}]
 ```
-The window engine resolves the referenced measure's aggregate first, then applies the window. Re-inlining SUMs would force editing every COGS-component change in N places (1 base + N windows) instead of 1.
 
 ## Metric view YAML primer
 
@@ -54,7 +50,8 @@ Self-contained reference for the YAML inside `CREATE VIEW … WITH METRICS LANGU
 ### Prerequisites
 - Databricks Runtime **17.2+**. **Always use YAML `version: "1.1"`** — for everything (dimensions, measures, window measures alike).
 - On DBR < 17.2, dim `comment:`/`synonyms:` aren't recognized by the older serde — re-run the script with `--no-dim-metadata` to strip them. Measures keep full metadata regardless.
-- SQL warehouse with `CAN USE`; `SELECT` on source tables; `CREATE TABLE`/`USE SCHEMA` in the target schema.
+- **A SQL warehouse** with `CAN USE`; `SELECT` on source tables; `CREATE TABLE`/`USE SCHEMA` in the target schema. **Pick the best already-running warehouse** for `execute_sql` calls in this workflow — use `manage_warehouse` action `get_best` (prefers running > starting, then smaller sizes) so the verify burst doesn't pay a cold-start. Don't force serverless if a suitable classic/pro warehouse is already warm.
+- **Serverless compute for Python.** The scaffolder is pure stdlib so it normally runs locally. If you do invoke it on Databricks (notebook task, `execute_code`, etc.), pass `compute_type="serverless"` (or schedule on a serverless job cluster). Do not start a classic interactive cluster for this — the script finishes in seconds and a cluster startup wastes minutes.
 
 ### Top-level structure
 
@@ -119,18 +116,22 @@ measures:
 
 ## Inputs — `.pbit` only
 
-**The script reads `.pbit` (Power BI Template).** A `.pbit` is a ZIP that includes a `DataModelSchema` JSON file containing the **full** TMSL: every base column, every calculated column, every measure (DAX preserved verbatim), every relationship, with types — exactly what PBI Desktop sees. No third-party library needed; the parser uses only the Python stdlib.
+The script reads `.pbit` (Power BI Template) — a ZIP with a `DataModelSchema` JSON containing the full TMSL: every base column, calculated column, measure (DAX verbatim), and relationship, with types. Stdlib parser, no third-party library.
 
-**Why not `.pbix`?** A `.pbix` stores the model in an XPRESS9-compressed Analysis Services backup binary. Community Python readers (pbixray and friends) reverse-engineer it incompletely — base columns from M-loaded tables (e.g., the `Date` PK on a typical `D_Calendar`) silently disappear. `.pbit` exposes the same metadata as plain JSON, so what you see is what gets scaffolded.
-
-**Getting a `.pbit` from a `.pbix`:** Open the `.pbix` in Power BI Desktop → **File → Export → Power BI Template (`.pbit`)**. One click. See `references/extracting-pbi-models.md` for other source formats.
+**Not `.pbix`** — its XPRESS9-compressed AS backup is reverse-engineered incompletely by pbixray (M-loaded base columns silently disappear). To convert: PBI Desktop → **File → Export → Power BI Template (`.pbit`)**. See `references/extracting-pbi-models.md` for other formats.
 
 ## Workflow
 
 1. **Get the `.pbit`** (export from PBI Desktop — see Inputs above).
 
-2. **Run the scaffolder**:
+2. **Pre-flight: ask the user whether the target tables already exist, and where** (use `AskUserQuestion` or direct ask): catalog.schema, fact + dim table names. Then branch:
+   - **Tables exist** → run scaffolder **without** `--emit-ddl` (view only). Skip step 4 (schema) and step 7's DDL portion. If the fact name differs from `fact_<suffix>`, pass `--source CATALOG.SCHEMA.EXISTING_FACT_NAME`; if dim names differ from `dim_<table>`, edit each `joins: source:` line. If columns aren't snake_case, either re-run with `--style fidelity` or edit dim/measure exprs to match.
+   - **Tables don't exist** → run scaffolder **with** `--emit-ddl`. Steps 4 and 7 create the schema and tables.
+   - **Mixed / unsure** → safe to run with `--emit-ddl` (DDL is `IF NOT EXISTS`). Existing tables stay intact. If any existing table has a different schema than the `.pbit` would produce, the view may fail to compile — ask: keep existing (adjust YAML), or `DROP TABLE` and recreate (destructive — explicit consent required).
+
+3. **Run the scaffolder** (locally — pure Python stdlib):
    ```bash
+   # Tables don't exist — emit DDL + metric view scaffold
    python3 scripts/dax_to_metric_view.py model.pbit \
      --catalog-schema main.sales \
      --emit-ddl \
@@ -138,36 +139,40 @@ measures:
      --verify \
      --emit-verify-sql \
      --out main_sales.sql
-   ```
-   Produces:
-   - `CREATE OR REPLACE TABLE main.sales.dim_*` (one per non-fact table) and `main.sales.fact_profitability` for the fact
-   - `CREATE OR REPLACE VIEW main.sales.fact_profitability_metrics WITH METRICS LANGUAGE YAML AS $$ ... $$` — a SCAFFOLD with measure exprs as `AGENT_TRANSLATE_DAX` and comments as `AGENT_AUTHOR`
-   - A verification SQL block (commented out) — one `SELECT MEASURE(\`X\`) FROM view LIMIT 1` per measure
 
-3. **Create the schema** (the script doesn't):
+   # Tables already exist — metric view only (no --emit-ddl)
+   python3 scripts/dax_to_metric_view.py model.pbit \
+     --catalog-schema main.sales \
+     --source main.sales.existing_fact_table \
+     --fact-suffix profitability \
+     --verify \
+     --emit-verify-sql \
+     --out main_sales.sql
+   ```
+   Produces (DDL mode): `CREATE TABLE IF NOT EXISTS main.sales.dim_*` per table + `main.sales.fact_profitability`. Always: `CREATE OR REPLACE VIEW main.sales.fact_profitability_metrics WITH METRICS LANGUAGE YAML AS $$ ... $$` with `AGENT_TRANSLATE_DAX` / `AGENT_AUTHOR` placeholders, plus a commented verify block (one `SELECT MEASURE(\`X\`) FROM view LIMIT 1` per measure).
+
+   If running on Databricks instead of locally: use `compute_type="serverless"` (see Prerequisites).
+
+4. **Create the schema** (skip if tables already exist):
    ```sql
    CREATE SCHEMA IF NOT EXISTS main.sales COMMENT 'PBI migration: ...';
    ```
 
-4. **Translate every measure.** For each `# === Measure i/N: …` block in the scaffold:
+5. **Translate every measure.** For each `# === Measure i/N: …` block in the scaffold:
    - Read the preserved original DAX (in the `# Original DAX:` block)
    - Translate to metric-view SQL using `references/dax-to-sql-patterns.md` as the cookbook + your own DAX knowledge. Most patterns are mechanical — `SUM('T'[col])` → `SUM(\`col\`)`; `CALCULATE(SUM, 'T'[c]=v)` → `SUM(...) FILTER (WHERE \`c\` = v)`; `IF` → `CASE WHEN … THEN … ELSE … END`. The "Constructs needing extra care" table below lists the patterns that require judgment.
    - LLM-author a one-line `comment:` capturing business meaning (units, scope, snapshot semantics) — see § Synonyms (auto) and comments (LLM-authored) below for examples
    - Replace `expr: AGENT_TRANSLATE_DAX` with your translation, `comment: AGENT_AUTHOR` with your comment
    - Same for dimensions: replace each `# comment: AGENT_AUTHOR …` with a one-line LLM-authored business-meaning comment
 
-5. **Augment `source:` with snapshot flags** if any measure needs `is_latest_snapshot` / `is_first_snapshot` / `is_yesterday_snapshot`. Standard pattern is in § Source augmentation above. Look for these triggers in the original DAX:
+6. **Augment `source:` with snapshot flags** if any measure needs `is_latest_snapshot` / `is_first_snapshot` / `is_yesterday_snapshot`. Standard pattern is in § Source augmentation above. Look for these triggers in the original DAX:
    - `LASTDATE(...)` as CALCULATE filter → `is_latest_snapshot`
    - `FIRSTDATE(...)` as CALCULATE filter → `is_first_snapshot`
    - `DATEADD(LASTDATE(...), -1, DAY)` as CALCULATE filter → `is_yesterday_snapshot`
 
-6. **Run the SQL** via `execute_sql` against the workspace. Schema → DDL → CREATE VIEW.
+7. **Run the SQL** via `execute_sql` against the **best already-running warehouse** (use `manage_warehouse` action `get_best` — prefers running > starting, then smaller sizes; serverless or classic, whichever is warm). Order: schema (step 4) → DDL (safe to run even when some tables exist — it's `IF NOT EXISTS`, never destructive) → CREATE VIEW.
 
-7. **Live compile-check.** Uncomment the verify SQL block at the bottom of the file (one `SELECT MEASURE(\`X\`) FROM view LIMIT 1` per measure) and run via `execute_sql`. Catches syntax errors, type mismatches, `MEASURE() FILTER` rejections, `BINARY_OP_DIFF_TYPES` on bad window-order types — anything the static check can't see.
-
-8. **Wire data ingestion as a separate step.** The tables are empty. Use Lakeflow Connect, PBI Desktop → Export → CSV → `COPY INTO`, or a Spark job.
-
-9. **Spot-check totals.** Once data is loaded, run `MEASURE(\`Total Revenue\`)` queries against the metric view and compare with the same measure in Power BI on a sample slice. Bidirectional cross-filtering and time intelligence are the usual divergence points.
+8. **Live compile-check.** Uncomment the verify SQL block at the bottom of the file (one `SELECT MEASURE(\`X\`) FROM view LIMIT 1` per measure) and run via `execute_sql`. Catches syntax errors, type mismatches, `MEASURE() FILTER` rejections, `BINARY_OP_DIFF_TYPES` on bad window-order types — anything the static check can't see. **This is the last step.** The tables stay empty; data ingestion is out of scope (see non-negotiable default #2). If the user wants to validate measure totals against PBI on real data, that requires a separate ingestion task — point them at the appropriate ingestion skill (Lakeflow Connect, `COPY INTO`, Spark) and stop here.
 
 ## Flags
 
@@ -194,75 +199,46 @@ The skill catches different bug classes at different points:
 | 2. **Static schema check** | Dimension column ref typos, alias mismatches | `--verify`, no DB needed | walks every dim expr, resolves backticks against source/joined columns. (Measure exprs are placeholders at scaffold time — Level 4 catches those.) |
 | 3. **Structural diff** | Lost or extra tables / measures / joins between PBIT and YAML | `--verify`, no DB needed | counts source PBIT vs scaffolded metric view |
 | 4. **Live compile check** | Syntax errors, type mismatches, `MEASURE() FILTER` rejections, anything the static check can't see | `--emit-verify-sql` then run via `execute_sql` (after agent fills in exprs) | `SELECT MEASURE(\`X\`) FROM view LIMIT 1` per measure — fails fast on any expression that doesn't compile |
-| 5. **Translation correctness** | Wrong SQL semantics (right syntax, wrong meaning) | Manual review | spot-check against the cookbook + sample queries against PBI |
-| 6. **Numerical equivalence** | DAX vs SQL produce same numbers | Manual | sample queries in PBI Desktop vs Databricks, compare CSVs |
+| 5. **Translation correctness (review-only)** | Wrong SQL semantics (right syntax, wrong meaning) | Manual review of YAML against cookbook | spot-check each measure expr against `references/dax-to-sql-patterns.md` — no data needed |
+
+Levels 4 and below are the full scope of this skill. Numerical equivalence (DAX vs SQL totals) requires loaded data and is out of scope per non-negotiable default #2.
 
 ## Synonyms (auto) and comments (LLM-authored)
 
-The scaffolder emits two distinct fields per **measure AND dimension** for documentation and discovery. Both objects get the same treatment — Genie/AI/BI search hits dimensions and measures equally, so dropping metadata on either side leaves a discovery hole.
+The scaffolder emits `synonyms:` and `comment:` per **measure AND dimension** — Genie/AI/BI hits both equally, so dropping metadata on either side leaves a discovery hole.
 
-### `synonyms:` — auto, mechanical, deduplicated against `name:`
+### `synonyms:` — auto, deduped against `name:`
 
-#### Measures
-
-Every emitted measure carries a `synonyms:` list with the original PBI measure name as a DAX bracket-form lookup. **Bare-name forms equal to `name:` are dropped** (would be redundant — Genie matches `name:` directly).
-
-The rule:
-
-- **No rename** (migrated `name:` equals the original PBI name): emit only the bracket form.
-  ```yaml
-  - name: Last Q AUR Actual
-    synonyms:
-      - "[Last Q AUR Actual]"  # bracket form only — bare name dedups against name:
-  ```
-
-- **Renamed** (migrated `name:` differs because of `%`/`/` etc. that aren't valid in metric-view names): emit both forms — the original bracket form AND the original bare form.
-  ```yaml
-  - name: QTD Order Load Pct ASP   # renamed: % → Pct
-    synonyms:
-      - "[QTD Order Load % ASP]"   # canonical DAX bracket form
-      - "QTD Order Load % ASP"     # original bare name (differs from name:, so kept)
-  ```
-
-#### Dimensions
-
-Every emitted dimension carries a `synonyms:` list. PBI columns are referenced in DAX as `'Table'[Column]` (qualified) — that's what the scaffolder emits, alongside the bare column name. Same dedup rule: anything matching `name:` is dropped.
+Always emits the canonical PBI form; bare-name forms matching `name:` are dropped.
 
 ```yaml
+# Measure, no rename — bracket only (bare-name dedups vs name:)
+- name: Last Q AUR Actual
+  synonyms: ["[Last Q AUR Actual]"]
+
+# Measure, renamed (% → Pct because % is invalid in metric-view names) — emit both
+- name: QTD Order Load Pct ASP
+  synonyms: ["[QTD Order Load % ASP]", "QTD Order Load % ASP"]
+
+# Dimension — bare PBI col name + DAX qualified form
 - name: D_Calendar Date
   expr: d_calendar.`date`
-  synonyms:
-    - Date                        # bare PBI col name
-    - "'D_Calendar'[Date]"        # canonical DAX qualified form
+  synonyms: ["Date", "'D_Calendar'[Date]"]
 ```
 
-Databricks metric views accept `synonyms:` per **measure and dimension** as a list. Genie / AI/BI consumers use it to resolve user queries to the right object when the migrated `name:` differs from what was typed.
+DBR < 17.2: dim `synonyms:` rejected (`Unrecognized field 'synonyms'`); re-run with `--no-dim-metadata` (measures unaffected).
 
-**DBR version note:** Measure `synonyms:`/`comment:` work on every recent DBR. **Dimension** `synonyms:`/`comment:` require the **v1.1 metric-view serde (DBR 17.2+)**; older runtimes only know `name/expr/window` on dims and reject the YAML with `Unrecognized field 'synonyms' …`. If you hit that error, either upgrade DBR or re-run with `--no-dim-metadata`.
+### `comment:` — LLM-authored
 
-### `comment:` — LLM-authored by the agent
+The scaffolder preserves the source PBI `description` verbatim if present, otherwise emits `AGENT_AUTHOR` for the agent to fill. **No regex-based generation** — shallow templates ("The bg_cd column", "Sum of x at yesterday's snapshot") land in UC as ground truth and mislead downstream tools.
 
-Comments are **the agent's responsibility**. The scaffolder:
+Good comments are short, factual, business-meaningful:
 
-- Preserves the source PBI `description` field verbatim if present (human-authored documentation always wins) — applies to both measures and dimensions.
-- Emits an `AGENT_AUTHOR` placeholder otherwise — the agent fills it.
-
-Why not rule-based: regex pattern detection over DAX or column names produces shallow, generic, often misleading text ("Ratio of x to expr", "Sum of qtd_shpmt at yesterday's snapshot", "The bg_cd column") that's worse than no comment. Once a misleading comment lands in UC, downstream tools (Genie, LLM agents indexing the catalog) treat it as ground truth.
-
-**Good agent comments** are short, factual, and business-meaningful:
-
-For measures:
-- `Target ASP for the latest snapshot, in millions of dollars.` ✓
-- `Total revenue at the latest data cutoff, in millions; excludes column-flag-1 rows.` ✓
-- `Days remaining in the current quarter (≥1 to avoid /0 in pacing calculations).` ✓
-- `Sum of qtd_shpmt_net_rev_amt at yesterday's snapshot.` ✗ (shallow rule-based — describes the SQL, not the business)
-
-For dimensions:
-- `Fiscal year string (e.g. "FY24"). Aligns with the company's fiscal calendar, not calendar year.` ✓
-- `Snapshot timestamp — the data-cutoff datetime each daily snapshot was taken at.` ✓
-- `Composite BG×Geo×Date marker; the value 'ISGPRC1' identifies the ISG/PRC bucket whose order_load is unreliable and is substituted with shipment.` ✓
-- `The bg_cd column.` ✗ (echoes the column name; says nothing)
-- `String column.` ✗ (type info — not business meaning)
+✓ `Target ASP for the latest snapshot, in millions of dollars.` (measure)
+✓ `Days remaining in the current quarter (≥1 to avoid /0 in pacing calculations).` (measure)
+✓ `Fiscal year string (e.g. "FY24"). Aligns with the company's fiscal calendar, not calendar year.` (dimension)
+✓ `Composite BG×Geo×Date marker; 'ISGPRC1' identifies the ISG/PRC bucket whose order_load is unreliable and is substituted with shipment.` (dimension)
+✗ `The bg_cd column.` / `String column.` / `Sum of qtd_shpmt at yesterday's snapshot.` (echoes the SQL or type; says nothing)
 
 ## Translation cookbook (agent uses these)
 
@@ -346,17 +322,16 @@ These are intentionally UI-only or non-aggregable — they aren't real KPIs and 
 
 ## Common mistakes
 
-- **Trying to feed a `.pbix` directly.** The script rejects `.pbix`. Export to `.pbit` from PBI Desktop first — that takes 1 click and gives you the full schema as JSON. Working around with pbixray silently drops base columns from M-loaded tables.
-- **PBI auto date/time hidden tables.** When **Auto date/time** is enabled in Power BI Desktop (the default), PBI silently generates one `DateTableTemplate_<GUID>` plus one `LocalDateTable_<GUID>` per Date column to drive the auto Year→Quarter→Month→Day hierarchy. They contain no real business data. The script excludes them from DDL emission, joins, dimensions, and fact-table picking via the `_AUTO_DATE_PREFIXES` filter.
-- **Auto-loading source data.** Don't. "Convert to tables" means structure. Data ingestion is a separate explicit step.
+- **Feeding a `.pbix` directly.** Script rejects it. Export to `.pbit` from PBI Desktop (one click). pbixray silently drops base columns from M-loaded tables.
+- **PBI auto date/time hidden tables.** When Auto date/time is enabled (default), PBI silently generates `DateTableTemplate_<GUID>` plus `LocalDateTable_<GUID>` per Date column. They have no business data. The script's `_AUTO_DATE_PREFIXES` filter excludes them from DDL, joins, dimensions, and fact-picking.
+- **Skipping the table-exists pre-flight (workflow step 2).** Even with `IF NOT EXISTS` protecting data, the agent must know whether to `--emit-ddl` and which names to point `source:`/`joins:` at.
 - **Defaulting to fidelity style without being asked.** Genie / AI / dbt expect Kimball snake_case.
-- **Trusting bidirectional cross-filter behavior.** Power BI's bidirectional filters silently change measure totals. Metric view joins are one-directional SQL `ON`. Sample-check totals against PBI before publishing.
-- **Forgetting `--catalog-schema`.** Without it, the YAML has `<TODO_CATALOG.SCHEMA>.<FactName>` placeholders and the SQL won't run.
-- **Deploying with `AGENT_TRANSLATE_DAX` placeholders still in the YAML.** Won't compile. Run the live compile-check (`--emit-verify-sql` block) after filling in expressions to catch any you missed.
-- **Forgetting to augment `source:` with snapshot flags.** When measures use `LASTDATE` / `FIRSTDATE` / `DATEADD(...,-1,DAY)` as CALCULATE filters, the agent must replace `source:` with the inline-SELECT pattern (see § Source augmentation). The script flags the fact's date column hint at the top of the measures section to make this easy.
-- **Ignoring the PBI author's commented-out "official" measure.** When a measure starts with `// =SUM(…) / 10^6 this is the official measure` followed by a workaround using `DATEADD`/`LASTDATE`/`CALCULATE`, prefer the *commented* official definition. The workaround is a band-aid for an upstream data lag the PBI author is waiting to fix; the simple commented version is what they intend the measure to be.
-- **Putting `FILTER` after the `/ N` division.** SQL `FILTER (WHERE …)` is a clause on the aggregate, not on the surrounding arithmetic. `SUM(x) FILTER (WHERE p) / 1000000` ✓ — `SUM(x) / 1000000 FILTER (WHERE p)` ✗ (parse error).
-- **Wrapping `MEASURE()` in `FILTER (WHERE …)`.** The engine rejects this. Inline the underlying aggregate expression instead.
-- **Treating inactive relationships as auto-translated.** The scaffolder skips relationships where `isActive=False` and warns. If a measure depends on `USERELATIONSHIP`, wire the join manually.
-- **Inlining raw `SUM(...)` in windowed measures instead of `MEASURE()` refs.** Already covered as non-negotiable default #3 — *do not* re-inline. If you find yourself typing `SUM(\`material_costs\`)+SUM(\`labor_costs_variable\`)+...` in a `window:` block, stop and replace with `MEASURE(\`Total COGS\`)`. The window engine resolves the referenced measure's aggregate first, then applies the window.
-- **Forgetting that `SUM('T'[col])` on a STRING column won't work.** If the source column is text but the DAX treats it numerically, either fix the source column type (DDL/ingest) or `try_cast` it inside the metric view's `source:` SQL.
+- **Trusting bidirectional cross-filter behavior.** PBI's bidirectional filters silently change totals; metric view joins are one-directional. If a relationship has `crossFilteringBehavior: bothDirections` in the PBIT, flag it in a YAML comment near the `joins:` entry — do not attempt numerical validation in this skill.
+- **Forgetting `--catalog-schema`.** YAML keeps `<TODO_CATALOG.SCHEMA>.<FactName>` placeholders and SQL won't run.
+- **Deploying with `AGENT_TRANSLATE_DAX` placeholders still in the YAML.** Won't compile — run the live compile-check (`--emit-verify-sql` block) to catch any you missed.
+- **Forgetting to augment `source:` with snapshot flags** when measures use `LASTDATE` / `FIRSTDATE` / `DATEADD(...,-1,DAY)` as CALCULATE filters. See § Source augmentation. The script flags the fact's date column hint above the measures section to make this easy.
+- **Ignoring the PBI author's commented-out "official" measure.** When a measure starts with `// =SUM(…) / 10^6 this is the official measure` followed by a workaround using `DATEADD`/`LASTDATE`/`CALCULATE`, prefer the *commented* official definition — the workaround is a band-aid for an upstream lag.
+- **Putting `FILTER` after `/ N` division.** `SUM(x) FILTER (WHERE p) / 1000000` ✓ — `SUM(x) / 1000000 FILTER (WHERE p)` ✗ (parse error). FILTER is a clause on the aggregate, not the arithmetic.
+- **Wrapping `MEASURE()` in `FILTER (WHERE …)`.** Rejected by engine — inline the underlying aggregate expression instead.
+- **Treating inactive relationships as auto-translated.** Scaffolder skips `isActive=False` and warns. If a measure depends on `USERELATIONSHIP`, wire the join manually.
+- **Aggregating a STRING column** when DAX treats it numerically. Fix the source column type (DDL/ingest) or `try_cast` inside the metric view's `source:` SQL.

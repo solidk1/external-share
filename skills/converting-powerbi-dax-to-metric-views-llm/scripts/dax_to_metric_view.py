@@ -10,7 +10,10 @@ is the **agent's** (LLM) job, not this script's. The script:
      base column, calculated column, measure DAX, and relationship.
   2. Picks a fact table (most measures, or --fact-table override).
   3. Builds star-schema joins from active relationships (warns on inactive).
-  4. Emits CREATE TABLE DDL for every table (kimball or fidelity style).
+  4. Emits CREATE TABLE IF NOT EXISTS DDL for every table (kimball or
+     fidelity style). Never destructive — existing tables are left intact.
+     If the table already exists with a different schema, the agent is
+     responsible for confirming with the user before dropping it.
   5. Emits a metric-view YAML SCAFFOLD where:
        - source / joins / dimensions are fully populated mechanically
        - synonyms are populated mechanically (PBI bracket / qualified form,
@@ -545,8 +548,10 @@ def emit_table_ddl(
                 seen_names[name] = 1
             spark_type = _spark_type(c.get("dataType"))
             col_lines.append(f"  `{name}` {spark_type}")
+        # IF NOT EXISTS — never replace a table that already holds data.
+        # If the user wants to recreate, they must DROP TABLE first explicitly.
         ddl = (
-            f"CREATE OR REPLACE TABLE {cs_prefix}.{physical} (\n"
+            f"CREATE TABLE IF NOT EXISTS {cs_prefix}.{physical} (\n"
             + ",\n".join(col_lines)
             + "\n)"
         )
